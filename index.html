@@ -2,12 +2,12 @@
 <html>
 <head>
     <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <link rel="manifest" href="manifest.json">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-
+<meta name="apple-touch-fullscreen" content="yes">
     <title>Mathsoccer - AI does the math. You score the goals.</title>
 
 <meta name="description" content="The world's only factor handoff system combining chess, maths and football. Score goals on a chess board using multiplication, division, factors and inequality.">
@@ -160,7 +160,39 @@
 
     </style>
 <script> 
+   const SCALED_FLOOR_MS = 600;
+const PHASE = {
+    HIGHLIGHT: 900,
+    HOLD:      2000,
+    GAP:       700,
+    TOKEN:     1000,
+    CALC:      300
+};
+
+const ARM_BASE_MS  = 300;
+const ARM_FLOOR_MS = 300;
+const REST_MS      = 1000;
+
+function inMove(ms) {
+    return Math.max(1, Math.round(ms));
+}
+
+function inArm() {
+    return Math.max(ARM_FLOOR_MS, Math.round(ARM_BASE_MS));
+}             
                 
+let _baseTransform = null;
+const FRAME_MS = 1000/30;
+// ✅ Use requestAnimationFrame for smooth rendering
+let renderRequested = false;
+
+function captureBaseTransform() {
+    if (ctx) _baseTransform = ctx.getTransform();
+}
+
+function resetMainTransform() {
+    if (ctx && _baseTransform) ctx.setTransform(_baseTransform);
+}
 
 // ============================================================
 // UNIVERSAL AUDIO & SPEECH FIX FOR ANDROID + IPHONE
@@ -235,7 +267,6 @@ function universalSpeak(text, rate=1, pitch=1) {
         }, 100);
     } catch(e) { console.log('Speak failed', e); }
 }
-// ============================================================
 
 
 // Initialize variables
@@ -243,6 +274,72 @@ function universalSpeak(text, rate=1, pitch=1) {
 let k=0;
 let g=0;
 let q=0;
+
+let guessMode = 'watch';        // 'watch' | 'guess'
+let awaitingGuess = false;
+let pendingGuessCell = null;
+let delayPickerVisible = false;
+let correctGuesses = 0;
+let totalGuesses = 0;
+let guessHighlightCell = null;
+let guessWindowMs = 5000;
+const DELAY_OPTIONS = [3000, 5000, 8000, 12000];
+const DELAY_LABELS  = ['3s', '5s', '8s', '12s'];
+
+try {
+    const saved = localStorage.getItem('mathsoccer_guess_window');
+    if (saved) guessWindowMs = parseInt(saved, 10);
+} catch (e) {}
+
+let realTimeouts = [];
+
+function gameSetTimeoutReal(callback, delayMs) {
+    const entry = {
+        callback: callback,
+        originalDelay: delayMs,
+        startTime: performance.now(),
+        id: null
+    };
+
+    entry.id = setTimeout(() => {
+        const idx = realTimeouts.indexOf(entry);
+        if (idx > -1) realTimeouts.splice(idx, 1);
+        if (gamePaused) {
+            const elapsed = performance.now() - entry.startTime;
+            entry.originalDelay = Math.max(0, entry.originalDelay - elapsed);
+            entry.startTime = performance.now();
+            realTimeouts.push(entry);
+            return;
+        }
+        callback();
+    }, delayMs);
+
+    realTimeouts.push(entry);
+    return entry.id;
+}
+
+
+function waitForAnimation(isRunningFn, onDone) {
+    const poll = () => {
+        if (!isRunningFn()) onDone();
+        else setTimeout(poll, 32);
+    };
+    poll();
+}
+
+
+// Two separate pools:
+//   - pendingDelays: pure delays that CAN re-arm on speed change
+//   - runningAnimations: animations already started, NEVER re-armed
+let pendingDelays = [];
+
+// Original timing constants — scaled by speed
+const BASE_AUTO_MOVE_DELAY = 7000;
+const BASE_COMP_DELAY      = 10000;
+const BASE_ANIM_DURATION   = 1000;
+const BASE_PULSE_DURATION  = 7000;
+const BASE_CALC_DURATION   = 3000;
+
 // At the top with other variables
 let playerName = localStorage.getItem('mathsoccer_player_name') || "YOU";
 let playerPhoto = localStorage.getItem('mathsoccer_player_photo') || null;
@@ -250,6 +347,15 @@ let playerPhotoData = null; // For storing the image object
 // ============================================================
 //  GLOBAL VARIABLES
 // ============================================================
+
+let decisionSnapshot = {
+    valid: [],
+    safe: [],
+    noGo: [],
+    exemptButtons: []
+};
+
+let c;
 
 let previousHeight = window.innerHeight;  // ← Add this
 // ============================================================
@@ -1034,10 +1140,10 @@ lifetimeStats = {
     ]
 };
 
-// ✅ Use requestAnimationFrame for smooth rendering
-let renderRequested = false;
 
 function requestRedraw() {
+    if (typeof moveManimationIsRunning === 'function' && moveManimationIsRunning()) return;
+    if (typeof showSimpleArmIsRunning === 'function' && showSimpleArmIsRunning()) return;
     if (!renderRequested) {
         renderRequested = true;
         requestAnimationFrame(() => {
@@ -1046,6 +1152,7 @@ function requestRedraw() {
         });
     }
 }
+
 
 
 // ============================================================
@@ -1277,6 +1384,9 @@ function getScreenType() {
 const explode = new Audio('explode.mp3');
 explode.volume = 1.0;
 
+const guess = new Audio('guess.mp3');
+guess.volume = 1.0;
+
 const touch = new Audio('Mathsoccer_touch.mp3');
 touch.volume = 1.0;
 
@@ -1305,7 +1415,7 @@ miss.volume = 1.0;  // ✅ Fix: miss, not loud
 ['touchstart','touchend','click'].forEach(evt => {
     window.addEventListener(evt, function primeAudio() {
         try {
-            [explode, touch, goal, ball, kick, loud, welcome, inland, miss].forEach(a => {
+            [explode, touch, goal, ball, kick, loud, welcome, inland, miss, guess].forEach(a => {
                 if (a) {
                     a.muted = true;
                     a.play().then(()=>{a.pause(); a.currentTime=0; a.muted=false;}).catch(()=>{a.muted=false;});
@@ -1328,7 +1438,7 @@ if (/iPhone|iPad|iPod/i.test(navigator.userAgent)) {
 }
 
 // Fix all audio elements for iPhone
-[explode, touch, goal, ball, kick, loud, welcome, inland, miss].forEach(a => {
+[explode, touch, goal, ball, kick, loud, welcome, inland, miss, guess].forEach(a => {
     if (a) {
         a.setAttribute('playsinline','');
         a.setAttribute('webkit-playsinline','');
@@ -1337,7 +1447,6 @@ if (/iPhone|iPad|iPod/i.test(navigator.userAgent)) {
     }
 });
 
-miss.volume = 1.0;  // ✅ Fix: miss, not loud
       // ============================================================
 //  RESIZE CANVAS — With Screen Type Tracking + Conservative Fallback
 // ============================================================
@@ -1350,6 +1459,33 @@ let previousWindowSize = { w: 0, h: 0 };
 
 const DESIGN_W = 360;
 const DESIGN_H = 800;
+// ===========================================
+// PAUSE / SPEED
+// ===========================================
+let gamePaused = false;
+let gameSpeedMultiplier = 1;
+const SPEED_OPTIONS = [0.5, 1, 2, 3];
+let speedIndex = 1;
+
+function speedLabel() {
+    if (gameSpeedMultiplier === 0.5) return '0.5×';
+    if (gameSpeedMultiplier === 1)   return '1×';
+    if (gameSpeedMultiplier === 2)   return '2×';
+    if (gameSpeedMultiplier === 3)   return '3×';
+    return '1×';
+}
+
+function togglePause() {
+    gamePaused = !gamePaused;
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    requestRedraw();
+}
+
+function cycleSpeed() {
+    speedIndex = (speedIndex + 1) % SPEED_OPTIONS.length;
+    gameSpeedMultiplier = SPEED_OPTIONS[speedIndex];
+    requestRedraw();
+}
 // ===========================================
 // SCREEN WAKE LOCK
 // ===========================================
@@ -1428,6 +1564,7 @@ ctx.scale(dpr, dpr);
     
     window._scale = scale;
     redrawGameScreen();
+    captureBaseTransform();
 }
 // ============================================================
 //  TOUCH SCALING — With Touch Detection + DPI
@@ -1552,7 +1689,7 @@ function resumeAudio() {
         }
         
         // Also resume all audio elements
-        const audioElements = [explode, touch, goal, ball, kick, loud, welcome, inland, miss];
+        const audioElements = [explode, touch, goal, ball, kick, loud, welcome, inland, miss, guess];
         audioElements.forEach(audio => {
             if (audio && audio.context && audio.context.state === 'suspended') {
                 audio.context.resume();
@@ -3109,7 +3246,7 @@ function createFirework(x, y) {
         const angle = Math.random() * 2 * Math.PI;
         const speed = 2 + Math.random() * 6;
         const color = colors[Math.floor(Math.random() * colors.length)];
-        const size = 3 + Math.random() * 5;
+        const size = 0.5 + Math.random() * 5;
         const trail = Math.random() > 0.7;
         
         fireworksParticles.push({
@@ -3133,28 +3270,31 @@ function spawnFirework() {
     createFirework(x, y);
 }
 
-function updateFireworks() {
+function updateFireworks(deltaMs) {
+    const factor = (deltaMs || 16.67) / 16.67;
+
     for (let i = fireworksParticles.length - 1; i >= 0; i--) {
         const p = fireworksParticles[i];
-        p.x += p.vx;
-        p.y += p.vy;
-        p.vy += 0.06;
-        p.vx *= 0.99;
-        p.vy *= 0.99;
-        p.life -= p.decay;
-        
+        p.x += p.vx * factor;
+        p.y += p.vy * factor;
+        p.vy += 0.06 * factor;
+        p.vx *= Math.pow(0.99, factor);
+        p.vy *= Math.pow(0.99, factor);
+        p.life -= p.decay * factor;
+
         if (p.trail) {
             p.trailPositions.push({x: p.x, y: p.y});
             if (p.trailPositions.length > 8) {
                 p.trailPositions.shift();
             }
         }
-        
+
         if (p.life <= 0) {
             fireworksParticles.splice(i, 1);
         }
     }
 }
+
 
 function drawFireworks() {
     // === DRAW TRAILS ===
@@ -3329,7 +3469,7 @@ function renderGameOverScreen() {
     ctx.font = 'bold 15px fantasy, papyrus';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('Concentrate. Calculate. Celebrate.', 180, 59); // X+10
+    ctx.fillText('...the way forward to number 1.', 180, 59); // X+10
     ctx.restore();
 
     // Circle with lines (makes the O with equal sign inside)
@@ -3834,16 +3974,26 @@ ctx.fillStyle = playerColor;  // ← Changed from '#FFFFFF'
             ctx.textBaseline = 'middle';
             ctx.fillText(goal.id, 35, redScorerY + 1);
 
-            ctx.shadowBlur = 0;
-            ctx.shadowOffsetX = 0;
-            ctx.shadowOffsetY = 0;
-            ctx.fillStyle = '#A8C9A8';
-            ctx.font = '9px fantasy, papyrus';
-            ctx.textAlign = 'left';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(goal.moveN, 45, redScorerY + 1); // X+10
+            // ✅ DRAW ASSIST (if it exists)
+if (goal.assist) {
+    ctx.fillStyle = goal.col; // Team colour
+    ctx.font = 'bold 9px fantasy, papyrus';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(goal.assist, 45, redScorerY - 6); // Above
+}
 
-            redScorerY += scorerSpacing;
+// Move number
+ctx.shadowBlur = 0;
+ctx.shadowOffsetX = 0;
+ctx.shadowOffsetY = 0;
+ctx.fillStyle = '#A8C9A8';
+ctx.font = '9px fantasy, papyrus';
+ctx.textAlign = 'left';
+ctx.textBaseline = 'middle';
+ctx.fillText(goal.moveN, 45, redScorerY + 4); // Pushed down
+
+redScorerY += scorerSpacing;
         }
     }
 
@@ -3896,16 +4046,26 @@ ctx.fillStyle = playerColor;  // ← Changed from '#FFFFFF'
             ctx.textBaseline = 'middle';
             ctx.fillText(goal.id, 315, blueScorerY + 1);
 
-            ctx.shadowBlur = 0;
-            ctx.shadowOffsetX = 0;
-            ctx.shadowOffsetY = 0;
-            ctx.fillStyle = '#A8C9A8';
-            ctx.font = '9px fantasy, papyrus';
-            ctx.textAlign = 'right';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(goal.moveN, 305, blueScorerY + 1);
+            // ✅ DRAW ASSIST (if it exists)
+if (goal.assist) {
+    ctx.fillStyle = goal.col; // Team colour
+    ctx.font = 'bold 9px fantasy, papyrus';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(goal.assist, 305, blueScorerY - 6); // Above
+}
 
-            blueScorerY += scorerSpacing;
+// Move number
+ctx.shadowBlur = 0;
+ctx.shadowOffsetX = 0;
+ctx.shadowOffsetY = 0;
+ctx.fillStyle = '#A8C9A8';
+ctx.font = '9px fantasy, papyrus';
+ctx.textAlign = 'right';
+ctx.textBaseline = 'middle';
+ctx.fillText(goal.moveN, 305, blueScorerY + 4); // Pushed down
+
+blueScorerY += scorerSpacing;
         }
     }
      if (isFireworksRunning) {
@@ -4142,40 +4302,59 @@ function startFireworks() {
     fireworksParticles = [];
     fireworksStartTime = performance.now();
     isFireworksRunning = true;
-    
+
     if (fireworksAnimationId) {
         cancelAnimationFrame(fireworksAnimationId);
     }
-    
- function animateFireworks(timestamp) {
-    const elapsed = timestamp - fireworksStartTime;
-    
-    if (elapsed >= fireworksDuration) {
-        isFireworksRunning = false;
-        fireworksAnimationId = null;
-        animationInProgress = false;
-        touchEnabled = true;
-        
-        // ✅ Redraw clean game over screen WITHOUT fireworks
-        renderGameOverScreen();
-        return;
+
+    let lastFrameTime = null;
+    let frameCount = 0;
+
+    function animateFireworks(timestamp) {
+        const elapsed = timestamp - fireworksStartTime;
+
+        if (elapsed >= fireworksDuration) {
+            isFireworksRunning = false;
+            fireworksAnimationId = null;
+            animationInProgress = false;
+            touchEnabled = true;
+            renderGameOverScreen();
+            return;
+        }
+
+        const deltaMs = lastFrameTime ? (timestamp - lastFrameTime) : 16.67;
+        lastFrameTime = timestamp;
+
+        if (Math.random() < 0.15) spawnFirework();
+        if (Math.random() < 0.10) spawnFirework();
+
+        updateFireworks(deltaMs);
+
+        frameCount++;
+        if (frameCount % 3 === 0) {
+            renderGameOverScreen();
+        } else {
+            ctx.save();
+            drawFireworks();
+            ctx.restore();
+        }
+
+        fireworksAnimationId = requestAnimationFrame(animateFireworks);
     }
-    
-    // Spawn new fireworks
-    if (Math.random() < 0.15) spawnFirework();
-    if (Math.random() < 0.10) spawnFirework();
-    
-    // Update particle physics
-    updateFireworks();
-    
-    // ✅ Redraw game over screen (achievements stay visible)
-    renderGameOverScreen();
-    
-    // Continue animation
+
     fireworksAnimationId = requestAnimationFrame(animateFireworks);
 }
-    
-    fireworksAnimationId = requestAnimationFrame(animateFireworks);
+
+
+function stopFireworks() {
+    if (fireworksAnimationId) {
+        cancelAnimationFrame(fireworksAnimationId);
+        fireworksAnimationId = null;
+    }
+    isFireworksRunning = false;
+    fireworksParticles = [];
+    animationInProgress = false;
+    touchEnabled = true;
 }
 
 // ===========================================
@@ -4326,112 +4505,151 @@ function announceGameOver() {
 
 let armSimpleAnimationId = null;
 
+function showSimpleArmIsRunning() {
+    return armSimpleAnimationId !== null;
+}
+
 function showSimpleArm(button, targetCell) {
     if (armSimpleAnimationId) {
         cancelAnimationFrame(armSimpleAnimationId);
+        armSimpleAnimationId = null;
     }
-animationInProgress = true;
-            touchEnabled = false;
-    
-    let startTime = null;
-    const duration = 1000; // 1.5 seconds
-    
-    // Start at button center
-    const startX = button.x + 18;
-    const startY = button.y + 18;
-    const endX = targetCell.x + 21;
-    const endY = targetCell.y + 21;
-    
-    // Store the button to keep it visible
-    const movingButton = button;
+
+    animationInProgress = true;
+    touchEnabled = false;
+
+    const startX = button.x + 16;
+    const startY = button.y + 16;
+    const endX   = targetCell.x + 19;
+    const endY   = targetCell.y + 19;
+
     const buttonColor = button.col;
-    const buttonId = button.id;
-    
-    function animate(timestamp) {
-        if (!startTime) startTime = timestamp;
-        const elapsed = timestamp - startTime;
-        let progress = Math.min(elapsed / duration, 1);
-        
-        // Ease out for smooth deceleration
-        const easedProgress = 1 - Math.pow(1 - progress, 2);
-        
-        const currentX = startX + (endX - startX) * easedProgress;
-        const currentY = startY + (endY - startY) * easedProgress;
-        
-        // ===========================================
-        // REDRAW EVERYTHING
-        // ===========================================
-        ctx.clearRect(0, 0, cW, cH);
-        renderAnswer();
-        
-        // ✅ Draw ALL buttons (including the moving one) but we'll redraw it on top
-        renderButtons();
-        renderStats();
-        if (!matchInProgress) {
+    const buttonId    = button.id;
+    const BASE_DURATION = ARM_BASE_MS;
+    const armDurationMs = inArm();
+    const ARM_MIN_VISIBLE_MS = 220; 
+
+    const armColor     = (button.col === 'red')  ? '#FF0000' :
+                         (button.col === 'blue') ? '#0000FF' : '#3498DB';
+    const armColorDark = (button.col === 'red')  ? '#990000' :
+                         (button.col === 'blue') ? '#000033' : '#145A32';
+
+    // =============================================
+    // 1. Bake static scene (offscreen, identity transform)
+    // =============================================
+    const dpr = window._dpr || 1;
+
+    const baseCanvas = document.createElement('canvas');
+    baseCanvas.width  = 360 * dpr;
+    baseCanvas.height = 800 * dpr;
+    const baseCtx = baseCanvas.getContext('2d');
+
+    // Swap ctx to baseCtx to draw the static board
+    const save0 = ctx;
+    ctx = baseCtx;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, 360, 800);
+    renderAnswer();
+    renderButtons();
+    renderStats();
     statDraw(va, vb, vc, vd, ve, vf, vg, vh);
-}
-        drawScorer();
+    drawScorer();
+    if (selectedButton) {
+        highlightButtonAndNumbers(selectedButton, selectedButtonLinks);
+    }
+    drawToggles();
+    ctx = save0; // Restore main ctx
+
+    // =============================================
+    // 2. Offscreen frame buffer
+    // =============================================
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width  = 360 * dpr;
+    offCanvas.height = 800 * dpr;
+    const offCtx = offCanvas.getContext('2d');
+
+    let startTime  = null;
+    let lastFrameT = 0;
+    let pausedAt   = 0;
+    let accumulatedPause = 0;
+
+    function animate(timestamp) {
+        if (gamePaused) {
+            if (!pausedAt) pausedAt = timestamp;
+            armSimpleAnimationId = requestAnimationFrame(animate);
+            return;
+        }
+        if (pausedAt) {
+            accumulatedPause += timestamp - pausedAt;
+            pausedAt = 0;
+        }
+
+        if (!startTime) startTime = timestamp;
+
+        // Frame-rate gate (30 fps) - Keep this, it's part of your HvA timing
+        if (timestamp - lastFrameT < FRAME_MS) {
+            armSimpleAnimationId = requestAnimationFrame(animate);
+            return;
+        }
+        lastFrameT = timestamp;
+
+        const armDurationMs = Math.max(ARM_MIN_VISIBLE_MS, BASE_DURATION);
+        const effectiveElapsed = timestamp - startTime - accumulatedPause;
+        const progress = Math.min(effectiveElapsed / armDurationMs, 1);
+
+        const eased    = 1 - Math.pow(1 - progress, 2);
+        const currentX = startX + (endX - startX) * eased;
+        const currentY = startY + (endY - startY) * eased;
+
+        // =============================================
+        // 3. Compose frame on offscreen canvas
+        // =============================================
+        const saveInner = ctx;
+        ctx = offCtx;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, 360, 800);
         
-        // ===========================================
-        // DRAW ARM
-        // ===========================================
-        ctx.save();
-        
-        // Arm glow
-        ctx.shadowColor = '#2E86C1';
-        ctx.shadowBlur = 20;
-        
-        // Draw arm line
+        // Draw the baked static board
+        ctx.drawImage(baseCanvas, 0, 0, 360, 800);
+
+        // Draw the arm line
         ctx.beginPath();
         ctx.moveTo(startX, startY);
         ctx.lineTo(currentX, currentY);
-        ctx.strokeStyle = '#3498DB';
+        ctx.strokeStyle = armColor;
         ctx.lineWidth = 10;
+        ctx.lineCap = 'round';
         ctx.stroke();
         
-        // Draw hand
-        ctx.shadowColor = '#FFD700';
-        ctx.shadowBlur = 25;
+        // Darker outline for depth
+        ctx.beginPath();
+        ctx.moveTo(startX, startY);
+        ctx.lineTo(currentX, currentY);
+        ctx.strokeStyle = armColorDark;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Hand
         ctx.beginPath();
         ctx.arc(currentX, currentY, 14, 0, 2 * Math.PI);
         ctx.fillStyle = '#FDBCB4';
         ctx.fill();
-        ctx.shadowBlur = 10;
         ctx.strokeStyle = '#8B4513';
         ctx.lineWidth = 2;
         ctx.stroke();
-        
-        // Draw finger
-        const angle = Math.atan2(endY - startY, endX - startX);
+
+        // Finger
+        const angle   = Math.atan2(endY - startY, endX - startX);
         const fingerX = currentX + Math.cos(angle) * 14;
         const fingerY = currentY + Math.sin(angle) * 14;
-        ctx.shadowBlur = 5;
         ctx.beginPath();
         ctx.moveTo(currentX, currentY);
         ctx.lineTo(fingerX, fingerY);
         ctx.strokeStyle = '#FDBCB4';
         ctx.lineWidth = 5;
         ctx.stroke();
-        
-        ctx.shadowBlur = 0;
-        ctx.restore();
-        
-        // ===========================================
-        // ✅ DRAW THE MOVING BUTTON ON TOP (LAST)
-        // ===========================================
-        ctx.save();
-        
-        // Glowing outline
-        ctx.shadowColor = '#FFD700';
-        ctx.shadowBlur = 20;
-        ctx.beginPath();
-        ctx.arc(startX, startY, 18, 0, 2 * Math.PI);
-        ctx.strokeStyle = 'rgba(255, 215, 0, 0.6)';
-        ctx.lineWidth = 3;
-        ctx.stroke();
-        ctx.shadowBlur = 0;
-        
-        // Button body
+
+        // Original button
         ctx.beginPath();
         ctx.arc(startX, startY, 18, 0, 2 * Math.PI);
         ctx.fillStyle = buttonColor;
@@ -4439,8 +4657,7 @@ animationInProgress = true;
         ctx.strokeStyle = 'black';
         ctx.lineWidth = 2;
         ctx.stroke();
-        
-        // Gradient light
+
         const grd = ctx.createRadialGradient(startX - 6, startY - 6, 0, startX - 6, startY - 6, 4);
         grd.addColorStop(0, 'white');
         grd.addColorStop(1, 'black');
@@ -4448,46 +4665,45 @@ animationInProgress = true;
         ctx.arc(startX - 6, startY - 6, 4, 0, 2 * Math.PI);
         ctx.fillStyle = grd;
         ctx.fill();
-        
-        // Button label
+
         ctx.font = 'bold 18px fantasy, papyrus';
         ctx.fillStyle = '#CFC';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(buttonId, startX, startY + 2);
-        
-        ctx.restore();
-        
-        // ===========================================
-        // DRAW HIGHLIGHTS & TOGGLES
-        // ===========================================
-        if (selectedButton) {
-            highlightButtonAndNumbers(selectedButton, selectedButtonLinks);
-        }
-        drawToggles();
-        
-        // ===========================================
-        // ANIMATION COMPLETE
-        // ===========================================
+
+        ctx = saveInner; // Restore main ctx
+
+        // =============================================
+        // 4. Blit to main canvas
+        // =============================================
+        resetMainTransform();
+        ctx.clearRect(0, 0, 360, 800);
+        ctx.drawImage(offCanvas, 0, 0, 360, 800);
+
         if (progress < 1) {
             armSimpleAnimationId = requestAnimationFrame(animate);
         } else {
+            // =============================================
+            // 5. Final Redraw (Only happens ONCE at the end)
+            // =============================================
             armSimpleAnimationId = null;
-         
-            // Final clean redraw
-            ctx.clearRect(0, 0, cW, cH);
+            animationInProgress  = false;
+            touchEnabled         = true;
+
+            resetMainTransform();
+            ctx.clearRect(0, 0, 360, 800);
             renderAnswer();
             renderButtons();
             renderStats();
-           // statDraw(va, vb, vc, vd, ve, vf, vg, vh);
+            statDraw(va, vb, vc, vd, ve, vf, vg, vh);
             if (selectedButton) {
                 highlightButtonAndNumbers(selectedButton, selectedButtonLinks);
             }
             drawToggles();
-
         }
     }
-    
+
     armSimpleAnimationId = requestAnimationFrame(animate);
 }
 
@@ -6658,6 +6874,10 @@ function startLoadingAnimation() {
     loadingProgress = 0;
     
     function animateLoading() {
+    if (gamePaused) {
+        animationFrameId = requestAnimationFrame(animate);
+        return;
+    }
         if (splashSkipped) return;
         
         const elapsed = Date.now() - splashStartTime;
@@ -6721,8 +6941,8 @@ function logo() {
     ctx.font = 'bold 15px fantasy, papyrus';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('Concentrate. Calculate. Celebrate.', 180, 414);  // Y+25
-ctx.fillText('Version 1.8.7', 180, 780);  // Y+25
+    ctx.fillText('...the way forward to number 1.', 180, 414);  // Y+25
+ctx.fillText('Version 2.1.7', 180, 780);  // Y+25
 
 // Loading text
     ctx.fillStyle = '#CFC';
@@ -6827,6 +7047,7 @@ function getButtonColors(color) {
     
     return { lightColor, darkColor };
 }
+
 
 function renderLevels(k, l, m, n) {
     // ✅ Apply X+10 and Y+50 to button positions
@@ -7236,7 +7457,7 @@ function buildAnswerArray(side) {
 
     const goals = [
         {
-            id: "1",
+            id: 1,
             x: config.startX,
             y: config.startY,
             w: cellW,
@@ -7277,7 +7498,7 @@ function buildAnswerArray(side) {
     }
 
     goals.push({
-        id: "1",
+        id: 1,
         x: config.startX,
         y: config.startY + 8 * config.increY,
         w: cellW,
@@ -7438,7 +7659,7 @@ function renderAnswer() {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     if (!matchInProgress) {
-        ctx.fillText('Concentrate. Calculate. Celebrate.', 180, 59);
+        ctx.fillText('...the way forward to number 1.', 180, 59);
     }
     if (matchInProgress) {
         ctx.font = 'bold 11px fantasy, papyrus';
@@ -7533,6 +7754,8 @@ ctx.restore();
     // === 3D SIDE INDICATOR ===
     ctx.save();
     ctx.rotate(-0.6);
+    ctx.textAlign = 'center';
+ctx.textBaseline = 'middle';
     // Shadow
     ctx.shadowColor = 'rgba(0,0,0,0.6)';
     ctx.shadowBlur = 10;
@@ -7568,17 +7791,32 @@ ctx.restore();
     ctx.shadowOffsetX = 1;
     ctx.shadowOffsetY = 1;
 
+if(g<3){
+    ctx.fillStyle = '#0d47a1';  
+    ctx.font = 'bold 15px fantasy, papyrus';
+    ctx.fillText('A', 12, 54);
+
     ctx.fillStyle = '#004d00';
     ctx.font = 'bold 15px fantasy, papyrus';
-    ctx.fillText('Side', 11, 54);
+    ctx.fillText('v', 1, 54);
 
     ctx.fillStyle = '#b71c1c';
     ctx.font = 'bold 15px fantasy, papyrus';
-    ctx.fillText('a', -10, 54);
-
-    ctx.fillStyle = '#0d47a1';
+    ctx.fillText('H', -11, 54);
+    }
+    else{
+    ctx.fillStyle = '#0d47a1';  
     ctx.font = 'bold 15px fantasy, papyrus';
-    ctx.fillText('4', -19, 54);
+    ctx.fillText('A', 12, 54);
+
+    ctx.fillStyle = '#004d00';
+    ctx.font = 'bold 15px fantasy, papyrus';
+    ctx.fillText('v', 1, 54);
+
+    ctx.fillStyle = '#b71c1c';
+    ctx.font = 'bold 15px fantasy, papyrus';
+    ctx.fillText('A', -11, 54);
+    }
 
     ctx.restore();
 
@@ -7709,41 +7947,19 @@ ctx.restore();
         frameGoalMouths();
     }
 
-    if (g === 15 && matchInProgress) {
-        const soundX = 30; const soundY = 590; const soundW = 70; const soundH = 25;
-        window._soundToggleBox = { x: soundX, y: soundY, w: soundW, h: soundH };
-        ctx.save();
-        ctx.shadowColor = 'rgba(0,0,0,0.3)'; ctx.shadowBlur = 6; ctx.shadowOffsetX = 2; ctx.shadowOffsetY = 3;
-        const grad = ctx.createLinearGradient(soundX, soundY, soundX, soundY + soundH);
-        grad.addColorStop(0, soundEnabled? '#2E8B57' : '#FFD700');
-        grad.addColorStop(1, soundEnabled? '#1B5E20' : '#B8860B');
-        ctx.beginPath(); ctx.roundRect(soundX, soundY, soundW, soundH, 4);
-        ctx.fillStyle = grad; ctx.fill();
-        ctx.shadowBlur = 0; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
-        ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.roundRect(soundX, soundY, soundW, soundH, 4); ctx.stroke();
-        ctx.fillStyle = '#FFFFFF'; ctx.font = 'bold 8px fantasy, papyrus';
-        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-        ctx.fillText(soundEnabled? '🔊 SOUND' : '🔇 SND MUTE ', soundX + soundW/2, soundY + soundH/2);
-        ctx.restore();
-
-        const speechX = soundX + soundW + 155; const speechY = 590; const speechW = 70; const speechH = 25;
-        window._speechToggleBox = { x: speechX, y: speechY, w: speechW, h: speechH };
-        ctx.save();
-        ctx.shadowColor = 'rgba(0,0,0,0.3)'; ctx.shadowBlur = 6; ctx.shadowOffsetX = 2; ctx.shadowOffsetY = 3;
-        const grad2 = ctx.createLinearGradient(speechX, speechY, speechX, speechY + speechH);
-        grad2.addColorStop(0, speechEnabled? '#2E8B57' : '#FFD700');
-        grad2.addColorStop(1, speechEnabled? '#1B5E20' : '#B8860B');
-        ctx.beginPath(); ctx.roundRect(speechX, speechY, speechW, speechH, 4);
-        ctx.fillStyle = grad2; ctx.fill();
-        ctx.shadowBlur = 0; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
-        ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.roundRect(speechX, speechY, speechW, speechH, 4); ctx.stroke();
-        ctx.fillStyle = '#FFFFFF'; ctx.font = 'bold 8px fantasy, papyrus';
-        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-        ctx.fillText(speechEnabled? '🗣️ SPEECH' : '🔇 SPH MUTE ', speechX + speechW/2, speechY + speechH/2);
-        ctx.restore();
-    }
+    if (guessHighlightCell) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(255, 215, 0, 0.6)';
+    ctx.beginPath();
+    ctx.roundRect(guessHighlightCell.x, guessHighlightCell.y, guessHighlightCell.w, guessHighlightCell.h, 4);
+    ctx.fill();
+    ctx.strokeStyle = '#FFD700';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.roundRect(guessHighlightCell.x, guessHighlightCell.y, guessHighlightCell.w, guessHighlightCell.h, 4);
+    ctx.stroke();
+    ctx.restore();
+}
 }
 
 
@@ -8307,39 +8523,93 @@ if (matchInProgress || g === 1) return;
     ctx.fillStyle = glowGrad;
     ctx.fill();
     
-    // === TEXT LINES ===
-    // Y positions: 637→687, 652→702, 667→717, 682→732, 697→747, 712→762, 727→777
+    // ===========================================
+    // TEXT LINES — title white, list team-colored
+    // ===========================================
     const lines = [va, vb, vc, vd, ve, vf, vg];
     const yPositions = [687, 702, 717, 732, 747, 762, 777];
-    
+
     lines.forEach((text, index) => {
-        if (!text) return;
-        
-        ctx.save();
+    if (!text) return;
+
+    // vc is always white (no colon split needed)
+    // vc (index 2) is white after the first move,
+// but team-colored on the opening screen (n < 1)
+const isWhiteLine = (index === 8);
+
+    // Split "Title: rest" → white title + team-colored list
+    const colonIdx = text.indexOf(':');
+    const hasTitle = colonIdx > -1;
+
+    const titlePart = hasTitle ? text.slice(0, colonIdx + 1) : '';
+    const listPart  = hasTitle ? text.slice(colonIdx + 1).trimStart() : text;
+
+    ctx.save();
+    ctx.font = 'bold 14px fantasy, papyrus';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+
+    const titleWidth = hasTitle ? ctx.measureText(titlePart + ' ').width : 0;
+    const listWidth  = ctx.measureText(listPart).width;
+    const totalWidth = titleWidth + listWidth;
+    let cursorX = 180 - totalWidth / 2;
+
+    // ==========================================================
+    // vc (index 2) → draw the entire line in WHITE
+    // ==========================================================
+    if (isWhiteLine) {
+    ctx.font = 'bold 14px fantasy, papyrus';   // ← bumped from 14px for vc
+    ctx.shadowColor = 'rgba(0,0,0,0.4)';
+    ctx.shadowBlur = 8;
+    ctx.shadowOffsetX = 1;
+    ctx.shadowOffsetY = 2;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText(text, cursorX, yPositions[index]);
+
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText(text, cursorX, yPositions[index] - 1);
+
+    ctx.restore();
+    return;
+}
+
+    // ---------- TITLE (WHITE) ----------
+    if (hasTitle) {
         ctx.shadowColor = 'rgba(0,0,0,0.4)';
         ctx.shadowBlur = 8;
         ctx.shadowOffsetX = 1;
         ctx.shadowOffsetY = 2;
-        
-        if (text.length > 0) {
-            ctx.shadowColor = vh === 'red' ? 'rgba(255,0,0,0.15)' : 'rgba(0,100,255,0.15)';
-            ctx.shadowBlur = 15;
-        }
-        
-        ctx.fillStyle = vh;
-        ctx.font = 'bold 14px fantasy, papyrus';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(text, 180, yPositions[index]);  // X: 170 → 180 (+10)
-        
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText(titlePart, cursorX, yPositions[index]);
+
         ctx.shadowBlur = 0;
         ctx.shadowOffsetX = 0;
         ctx.shadowOffsetY = 0;
-        ctx.fillStyle = vh;
-        ctx.fillText(text, 180, yPositions[index] - 1);  // X: 170 → 180 (+10)
-        
-        ctx.restore();
-    });
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillText(titlePart, cursorX, yPositions[index] - 1);
+
+        cursorX += titleWidth;
+    }
+
+    // ---------- LIST (TEAM COLOR) ----------
+    ctx.shadowColor = vh === 'red' ? 'rgba(255,0,0,0.15)' : 'rgba(0,100,255,0.15)';
+    ctx.shadowBlur = 15;
+    ctx.shadowOffsetX = 1;
+    ctx.shadowOffsetY = 2;
+    ctx.fillStyle = vh;
+    ctx.fillText(listPart, cursorX, yPositions[index]);
+
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+    ctx.fillStyle = vh;
+    ctx.fillText(listPart, cursorX, yPositions[index] - 1);
+
+    ctx.restore();
+});
     
     // === DECORATIVE CORNER ACCENTS ===
     // X: 12→22 (+10), Y: 629→679 (+50)
@@ -8633,6 +8903,7 @@ calc.value=String(problemFactor+" \u00F7 "+problemFactor/targetAnswer.id+" = "+t
 
    let scorer = [];
 function drawMover() {
+c=0;
     if (lastMoveData) {
         const { button, targetCell, points } = lastMoveData;
         const mover = button;
@@ -8650,7 +8921,7 @@ if ((side === 0 && mover.col === "blue") || (side === 1 && mover.col === "red"))
 }
 
 function drawBut(x, y, but,N) {
-    const cx = x;
+   const cx = x;
     const cy = y;
     const r = 12;
     const colors = getButtonColors(but.col);
@@ -8716,7 +8987,17 @@ function drawBut(x, y, but,N) {
     ctx.textBaseline = 'middle';
     ctx.fillText(but.id, cx, cy + 1);
     
-    // Move number
+    // Assist provider — above the move number, smaller, team colour
+
+if(c===1){
+    ctx.fillStyle = but.col;
+    ctx.font = 'bold 11px fantasy, papyrus';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(but.assist, cx + 14, cy - 10);
+    }
+
+   // Move number
         ctx.fillStyle = '#FFD700';
         ctx.font = 'bold 12px fantasy, papyrus';
         ctx.textAlign = 'left';
@@ -8731,11 +9012,20 @@ function drawBut(x, y, but,N) {
 // ===========================================
 
 function drawScorer() {
+c=1;
     scorer.forEach((goal) => {
         drawBut(goal.x, goal.y, goal, goal.moveN);
     });
 }
     
+    function findAssist(scoringColor) {    
+        const m = gameHistory[gameHistory.length-3];
+        if (m.col === scoringColor) {
+            return m.but;
+        }    
+    return null;
+}
+
 // ===========================================
 // HELPER FUNCTION TO CAPITALIZE FIRST LETTER
 // ===========================================
@@ -8774,7 +9064,7 @@ function showCalculationAnimation(calculationText, teamColor) {
         }
     }
     
-    if (!calculationAnimationEnabled) return;
+  // if (!calculationAnimationEnabled) return;
     
     if (pulseAnimationActive) {
         console.log("Calculation animation deferred - pulse animation active");
@@ -8795,9 +9085,9 @@ function showCalculationAnimation(calculationText, teamColor) {
     
     // ✅ END POSITION (center of screen)
     const endX = 180;
-    const endY = 380;
-    
-    calcAnimationText = calculationText;
+    const endY = 430;    
+   
+    calcAnimationText = calculationText;    
     calcAnimationX = startX;
     calcAnimationY = startY;
     calcAnimationTeamColor = teamColor;
@@ -8806,16 +9096,20 @@ function showCalculationAnimation(calculationText, teamColor) {
     
     calcAnimationTargetX = endX;
     calcAnimationTargetY = endY;
- 
-   let chanceText = null;
+    
+    let chanceText = null;
     if (lastMoveData && lastMoveData.points) {
-           chanceText = getChanceTypeFromPoints(lastMoveData.points);
+        chanceText = getChanceTypeFromPoints(lastMoveData.points);
     }
     calcAnimationChanceText = chanceText;
     
     explosionSoundPlayed = false;
 
     function animate(timestamp) {
+        if (gamePaused) {
+            calcAnimationFrameId = requestAnimationFrame(animate);
+            return;
+        }
         if (!calcAnimationActive) return;
         
         if (timestamp - lastCalcFrameTime < calcFrameDelay) {
@@ -8829,8 +9123,7 @@ function showCalculationAnimation(calculationText, teamColor) {
             return;
         }
         
-        calcAnimationProgress += 0.02;
-        // ✅ DON'T reset flags inside loop
+        calcAnimationProgress += 0.04 * gameSpeedMultiplier;
 
         if (calcAnimationProgress >= 1) {
             // ✅ Reset flags ONLY on completion
@@ -8847,13 +9140,15 @@ function showCalculationAnimation(calculationText, teamColor) {
             renderAnswer();
             renderButtons();
             renderStats();
+
             if (!matchInProgress) {
-    statDraw(va, vb, vc, vd, ve, vf, vg, vh);
-    }
-    if (selectedButton) {
+                statDraw(va, vb, vc, vd, ve, vf, vg, vh);
+            }
+
+            if (selectedButton) {
                 highlightButtonAndNumbers(selectedButton, selectedButtonLinks);
             }
-                        return;
+            return;
         }
         
         // ===========================================
@@ -8863,15 +9158,16 @@ function showCalculationAnimation(calculationText, teamColor) {
         if (calcAnimationProgress < 0.4) {
             scale = 0.5 + (calcAnimationProgress / 0.4) * 2.0;
         } else if (calcAnimationProgress < 0.7) {
-            scale = 10;
+            scale = 1;
         } else {
-            // ✅ ORIGINAL: explosion sound at 0.4, but particles at 0.7
+            // ✅ EXPLOSION TRIGGER (Synced at 0.7)
             if (!explosionSoundPlayed) {
                 playSound(explode);
                 explosionSoundPlayed = true;
             }
-            const explodeProgress = (calcAnimationProgress - 0.4) / 0.3;
-            scale = 10 * (1 - explodeProgress * 1.5);
+            // Shrink from 10 down to 0 as progress goes from 0.7 to 1.0
+            const explodeProgress = (calcAnimationProgress - 0.7) / 0.3;
+            scale = 1 * (1 - explodeProgress);
         }
         
         // ===========================================
@@ -8886,7 +9182,7 @@ function showCalculationAnimation(calculationText, teamColor) {
                 ? 2 * moveProgress * moveProgress 
                 : 1 - Math.pow(-2 * moveProgress + 2, 2) / 2;
             currentX = startX + (endX - startX) * eased;
-            currentY = startY + (endY - startY) * eased;
+            currentY = startY + (endY + startY) / eased;
         } else {
             currentX = endX;
             currentY = endY;
@@ -8900,10 +9196,12 @@ function showCalculationAnimation(calculationText, teamColor) {
             renderAnswer();
             renderButtons();
             renderStats();
+            
             if (!matchInProgress) {
-    statDraw(va, vb, vc, vd, ve, vf, vg, vh);
-}            
-if (selectedButton) {
+                statDraw(va, vb, vc, vd, ve, vf, vg, vh);
+            }
+
+            if (selectedButton) {
                 highlightButtonAndNumbers(selectedButton, selectedButtonLinks);
             }
         } else {
@@ -8923,22 +9221,25 @@ if (selectedButton) {
         ctx.shadowColor = textColor;
         ctx.shadowBlur = 15;
         
+        // ✅ RESTORED ORIGINAL FONT SIZE (Fixed division by scale bug)
         let fontSize = 80;
         if (calcAnimationText && calcAnimationText.length > 10) {
             fontSize = 50;
         }
         
         ctx.fillStyle = textColor;
-        ctx.font = `bold ${Math.floor(fontSize / scale)}px fantasy, papyrus`;
+        ctx.font = `bold ${fontSize}px fantasy, papyrus`;
+        if (calculationAnimationEnabled){
         ctx.fillText(calcAnimationText, 0, 0);
+        }
         
         // ===========================================
-        // 4. CHANCE TEXT (ORIGINAL TIMING — STARTS AT 0.4)
+        // 4. CHANCE TEXT (FLASHES DURING EXPLOSION)
         // ===========================================
         if (calcAnimationChanceText && calcAnimationProgress > 0.4) {
-            const explodeProgress = (calcAnimationProgress - 0.4) / 0.3;
+            const explodeProgress = Math.min(1, (calcAnimationProgress - 0.4) / 0.3); // Clamped to 1
             const flashOpacity = 0.5 + 0.5 * Math.sin(explodeProgress * Math.PI * 8);
-            const chanceYOffset = -45 / scale;
+            const chanceYOffset = -45 / scale; 
             let chanceFontSize = 50;
             
             if (calcAnimationChanceText === "FULL CHANCE!") chanceFontSize = 40;
@@ -8948,13 +9249,13 @@ if (selectedButton) {
             
             ctx.globalAlpha = flashOpacity;
             ctx.fillStyle = calcAnimationTeamColor === 'red' ? '#FF8888' : '#8888FF';
-            ctx.font = `bold ${Math.floor(chanceFontSize / scale)}px fantasy, papyrus`;
+            ctx.font = `bold ${chanceFontSize}px fantasy, papyrus`;
             ctx.fillText(calcAnimationChanceText, 0, chanceYOffset);
             ctx.globalAlpha = 1;
             
             if (calcAnimationChanceText === "GOAL!") {
                 const sparkleCount = 16;
-                const sparkleScale = 1 / scale;
+                const sparkleScale = 1 / scale; // Keeps sparkles proportional to screen
                 for (let i = 0; i < sparkleCount; i++) {
                     const angle = (i / sparkleCount) * Math.PI * 2 + (explodeProgress * Math.PI * 8);
                     const distance = 100 * explodeProgress;
@@ -8972,7 +9273,7 @@ if (selectedButton) {
         }
         
         // ===========================================
-        // 5. PARTICLES (ORIGINAL — STARTS AT 0.7)
+        // 5. PARTICLES (STARTS AT 0.7)
         // ===========================================
         if (calcAnimationProgress > 0.7) {
             const explodeProgress = (calcAnimationProgress - 0.7) / 0.3;
@@ -8999,17 +9300,17 @@ if (selectedButton) {
         
         calcAnimationFrameId = requestAnimationFrame(animate);
     }
-  
-if (lastMoveData && calcAnimationChanceText === "GOAL!") {   
-const { button, targetCell, sourceCell, chanceType, points, moveTeam, nextTeam } = lastMoveData;
-const scoringTeam = moveTeam;
-    setTimeout(() => {
-        startPulsatingFrame(targetAnswer, scoringTeam);
-    }, 4000);
- }
- 
+
+    if (lastMoveData && calcAnimationChanceText === "GOAL!") {   
+        const { button, targetCell, sourceCell, chanceType, points, moveTeam, nextTeam } = lastMoveData;
+        const scoringTeam = moveTeam;
+        // ✅ Fixed undefined function (was gameSetTimeout)
+        setTimeout(() => {
+            startPulsatingFrame(targetAnswer, scoringTeam);
+        }, 4000);
+    }   
+    
     calcAnimationFrameId = requestAnimationFrame(animate);
-           
 }
 
 // ===========================================
@@ -9045,6 +9346,7 @@ function generateNextTurnDisplay() {
         const nextLinks = generateLinksForTeam(nextTeam);
         const formatLink = (id, arr) => arr.length > 0 ? `${id}(${arr.join(', ')})` : `${id}(no link)`;
         
+        if(h===1 && g===2){
         // Line 3: Header with capital
         vc = `Valid ${nextTeam} links:`;
         
@@ -9056,21 +9358,30 @@ function generateNextTurnDisplay() {
         vh = nextTeam;  // Keep original case for color
         //speakText(va);
     } 
-    else {
-        // Waiting screen - capitalize
-        const isRedTurn = (r % 2 !== 0);
-        const currentTeam = isRedTurn ? 'red' : 'blue';
-        const capitalizedTeam = capitalizeFirst(currentTeam);
-        
-        vc = `Waiting for ${capitalizedTeam} AI to move.`;
-        ve = "Selecting a destination number...";
-        va = "";
-        vb = "";
-        vd = "";
-        vf = "";
-        vg = "";
-        vh = currentTeam;  // Keep original case for color
-    }
+    else{
+    // ----------------------------------------------------------
+    // vc — DECISION LOOP TITLE
+    // ----------------------------------------------------------    
+    vc = lastMoveData ? 'AI DECISION LOOP' : 'AI DECISION LOOP';
+
+// ----------------------------------------------------------
+// SOURCE LISTS — from the snapshot taken at decision time
+// ----------------------------------------------------------
+const validList    = decisionSnapshot.valid;
+const safeList     = decisionSnapshot.safe;
+const noGoList     = decisionSnapshot.noGo;
+const exemptBtnIds = decisionSnapshot.exemptButtons;
+
+// ----------------------------------------------------------
+// Build display strings
+// ----------------------------------------------------------
+vd = `Linked numbers: ${validList.length ? validList.join(', ') : 'none'}`;
+ve = `Unsafe numbers: ${noGoList.length ? noGoList.join(', ') : 'none'}`;
+vg = `Busy tokens: ${exemptBtnIds.length ? exemptBtnIds.join(', ') : 'none'}`;
+vf = `Safe numbers: ${safeList.length ? safeList.join(', ') : 'none'}`;
+}
+}
+    
 }
 
 
@@ -9098,6 +9409,10 @@ function startPulsatingFrame(targetCell, teamColor) {
     const goalY = targetCell.y + targetCell.h / 2;
 
 function animatePulse(timestamp) {
+if (gamePaused) {
+        animationFrameId = requestAnimationFrame(animate);
+        return;
+    }
     if (!pulseAnimationActive) return;
     
     // Frame rate limiting
@@ -9108,7 +9423,8 @@ function animatePulse(timestamp) {
     lastPulseFrameTime = timestamp;
     
     const elapsed = timestamp - pulseStartTime;
-    const progress = Math.min(elapsed / pulseDuration, 1);
+    
+const progress = Math.min(elapsed / (pulseDuration / gameSpeedMultiplier), 1);
     
     // FIX 1: Save and reset context - prevents text scattering
     ctx.save();
@@ -9793,48 +10109,57 @@ if (!matchInProgress) {
     }
 }
 
+playSound(touch);        
 showCalculationAnimation(calc.value, moveTeam);      
 
     oldFac=problemFactor;
     
 probFac();
 
-if(targetAnswer.id==1){
+if (targetAnswer.id == 1) {
     const scoringTeam = moveTeam;
 
-if (matchInProgress) {  
-playSound(goal);
-speakText(`It's a GOAL!!!`);
-}   
-
-    // ✅ FIX: Scorer position based on side (same as drawMover logic)
-// side=0: Red is TOP, Blue is BOTTOM
-// side=1: Blue is TOP, Red is BOTTOM
-if ((side === 0 && targetButton.col === "blue") || (side === 1 && targetButton.col === "red")) {
-    // Scorer goes to TOP
-    buttons.forEach((curScor) => {
-        if (curScor.id === targetButton.id && curScor.col === targetButton.col) {
-            const goaler = curScor;
-            const moveN = n - 1;
-            scorer.push({ "id": targetButton.id, "col": targetButton.col, "x": topX, "y": topY, "moveN": moveN });
-        }
-    });
-    if (targetAnswer.id == 1) {
-        topY += 24;
+    if (matchInProgress) {
+        playSound(goal);
+        speakText(`It's a GOAL!!!`);
     }
-} else {
-    // Scorer goes to BOTTOM
-    buttons.forEach((curScor) => {
-        if (curScor.id === targetButton.id && curScor.col === targetButton.col) {
-            const goaler = curScor;
-            const moveN = n - 1;
-            scorer.push({ "id": goaler.id, "col": goaler.col, "x": botX, "y": botY, "moveN": moveN });
-        }
-    });
-    if (targetAnswer.id == 1) {
+
+    // Read the assist from gameHistory — the same team's previous move
+    const assistLetter = findAssist(targetButton.col);
+
+    if ((side === 0 && targetButton.col === "blue") || (side === 1 && targetButton.col === "red")) {
+        // Scorer goes to TOP
+        buttons.forEach((curScor) => {
+            if (curScor.id === targetButton.id && curScor.col === targetButton.col) {
+                const moveN = n - 1;
+                scorer.push({
+                    id: curScor.id,
+                    col: curScor.col,
+                    x: topX,
+                    y: topY,
+                    moveN: moveN,
+                    assist: assistLetter
+                });
+            }
+        });
+        topY += 24;
+    } else {
+        // Scorer goes to BOTTOM
+        buttons.forEach((curScor) => {
+            if (curScor.id === targetButton.id && curScor.col === targetButton.col) {
+                const moveN = n - 1;
+                scorer.push({
+                    id: curScor.id,
+                    col: curScor.col,
+                    x: botX,
+                    y: botY,
+                    moveN: moveN,
+                    assist: assistLetter
+                });
+            }
+        });
         botY -= 24;
     }
-}
 
 if (!matchInProgress) {  
 // Score update (from YOUR perspective - uses side)
@@ -9855,9 +10180,8 @@ if (playerGoals > opponentGoals) {
 else{
 speakText("It's" + redGoal + "goal to " + blueGoal + " after " + (n-1) + " moves!");
 }
-
-
-    var resetTime=setTimeout(function(){
+   
+var resetTime = setTimeout(function(){ 
 
 if (!matchInProgress) { 
 if (n > 28) {
@@ -9888,7 +10212,7 @@ generateNextTurnDisplay();
 statDraw(va,vb,vc,vd,ve,vf,vg,vh );  
 }
 }
-}, 8000);
+}, Math.max(500, 8000 / gameSpeedMultiplier));
 }
 
 speakText(`factor is equal to ${problemFactor}`);
@@ -9970,15 +10294,19 @@ function getGameState() {
 
   if(side==0){
     const dir = isRedTurn ? "up" : "down";
-    const positions = isRedTurn ? [answer[34], answer[32], answer[33], answer[36],answer[30], answer[26]] : [answer[2], answer[4], answer[3], answer[0],answer[6], answer[10]];
-    const attacked = isRedTurn ? [answer[2], answer[4], answer[3], answer[0],answer[6], answer[10]] : [answer[34], answer[32], answer[33], answer[36],answer[30], answer[26]];
+    const positions = isRedTurn ?
+[answer[34], answer[32], answer[33], answer[36], answer[30], answer[26], answer[28]]
+        : [answer[2],  answer[4],  answer[3],  answer[0],  answer[6],  answer[10], answer[8]];
+    
+    const attacked = isRedTurn ? [answer[2],  answer[4],  answer[3],  answer[0],  answer[6],  answer[10], answer[8]] : [answer[34], answer[32], answer[33], answer[36], answer[30], answer[26], answer[28]];
     return { isRedTurn, ownColor, opponentColor, dir, positions, attacked};
   }
 
   if(side==1){
     const dir = isRedTurn ? "down" : "up";
-    const positions = isRedTurn ?  [answer[2], answer[4], answer[3], answer[0],answer[6], answer[10]] : [answer[34], answer[32], answer[33], answer[36],answer[30], answer[26]];
-    const attacked = isRedTurn ?  [answer[34], answer[32], answer[33], answer[36],answer[30], answer[26]] : [answer[2], answer[4], answer[3], answer[0],answer[6], answer[10]];
+    const positions = isRedTurn ?  [answer[2],  answer[4],  answer[3],  answer[0],  answer[6],  answer[10], answer[8]] : [answer[34], answer[32], answer[33], answer[36], answer[30], answer[26], answer[28]];
+    const attacked = isRedTurn ?  [answer[34], answer[32], answer[33], answer[36], answer[30], answer[26], answer[28]]
+        : [answer[2],  answer[4],  answer[3],  answer[0],  answer[6],  answer[10], answer[8]];
     return { isRedTurn, ownColor, opponentColor, dir, positions, attacked};
   }
 }
@@ -10088,7 +10416,7 @@ function supportingGoalBlock(butn, cell) {
 // ===========================================
 
 function exposeCollinearThreat(cell) {
-    if (cell === compAns) return;
+    if (cell === compAns || cell.occupancy==="yes") return;
     const cellDir = categorizeButtonsByDirection(cell);
     const allDirs = ['right', 'left', 'up', 'down', 'up-left', 'up-right', 'down-left', 'down-right'];
     
@@ -10279,108 +10607,206 @@ function isOpponentGoalBlockerAtPos2(button) {
     return isOnCentralWhite;
 }
 
+
 // ===========================================
-// UNIFIED EXEMPTION CHECK
+// HELPER: isOnBlockedOpponentYellow
+// Detect if a button is on a yellow square whose gate
+// (adjacent white square) is occupied by the opponent.
 // ===========================================
-// Get safe numbers first
-const safeNumbers = strictMove();
+function isOnBlockedOpponentYellow(button, attacked, buttons, opponentColor) {
+    if (!button) return null;
+
+    // Left yellow gate check
+    if (button.x === attacked[4].x + 3 && button.y === attacked[4].y + 3) {
+        const oppOnGate = buttons.find(b =>
+            b.x === attacked[0].x + 3 &&
+            b.y === attacked[0].y + 3 &&
+            b.col === opponentColor
+        );
+        return oppOnGate ? { yellow: attacked[4], gate: attacked[0] } : null;
+    }
+
+    // Right yellow gate check
+    if (button.x === attacked[5].x + 3 && button.y === attacked[5].y + 3) {
+        const oppOnGate = buttons.find(b =>
+            b.x === attacked[1].x + 3 &&
+            b.y === attacked[1].y + 3 &&
+            b.col === opponentColor
+        );
+        return oppOnGate ? { yellow: attacked[5], gate: attacked[1] } : null;
+    }
+
+    return null;
+}
+
+// ===========================================
+// HELPER: computeSafeNumbersCount
+// Computes how many safe moves exist for the current player.
+// Uses a non-recursive approach so it can be called from
+// inside switchDirection without disturbing exemptButtons.
+// ===========================================
+function computeSafeNumbersCount() {
+    // Save the current state so strictMove()'s side effects
+    // don't leak into the caller.
+    const savedLogData = currentLogData;
+    currentLogData = {
+        linkedNumbers: [],
+        exemptedNumbers: [],
+        exemptedButtons: [],
+        choiceButton: null,
+        choiceNumber: null
+    };
+
+    let count = 0;
+    try {
+        const safe = strictMove();
+        count = (safe && safe.length) ? safe.length : 0;
+    } catch (e) {
+        console.warn("computeSafeNumbersCount failed:", e);
+        count = 0;
+    }
+
+    // Restore the log data we swapped out.
+    currentLogData = savedLogData;
+    return count;
+}
+
+// ===========================================
+// MAIN: Unified Rule 1 — Multi-Attacker Exemption
+// Runs inside the button loop of switchDirection().
+// ===========================================
+
+const safeNumbersCount = computeSafeNumbersCount();
 
 for (let btn of buttons) {
     if (btn.col !== ownColor) continue;
+
+    // --- Step 1: only consider multi-attackers ---
+    if (!isMultiAttacker(btn)) continue;
+
+    const fellows = getFellowMultiAttackers(btn);
+    const hasFellows = fellows.length > 0;
+
+    // --- Step 2: critical defender override ---
+    // Advanced difficulty (l < 2) also protected.
     
-    if (isMultiAttacker(btn)) {
-        const fellows = getFellowMultiAttackers(btn);
-        
-        // ===========================================
-        // FELLOWS CHECK — exempt fellow on blocked yellow
-        // ===========================================
-        if (fellows.length > 1) {
-            
-            const leftWhite   = blockWhite[0];
-            const rightWhite  = blockWhite[1];
-            const leftYellow  = yellowSquares[0];
-            const rightYellow = yellowSquares[1];
-            
-            const oppOnLeftWhite = buttons.find(b =>
-                b.x === leftWhite.x + 3 && b.y === leftWhite.y + 3 && b.col === opponentColor
-            );
-            const oppOnRightWhite = buttons.find(b =>
-                b.x === rightWhite.x + 3 && b.y === rightWhite.y + 3 && b.col === opponentColor
-            );
-            
-            let blockedYellow = null;
-            if (oppOnLeftWhite && !oppOnRightWhite) {
-                blockedYellow = leftYellow;
-            } else if (oppOnRightWhite && !oppOnLeftWhite) {
-                blockedYellow = rightYellow;
+    if(!hasFellows) continue; 
+    
+    if (isCriticalDefender(btn) && l < 1) {
+        exemptButtons.add(btn);
+        logExemptedButton(btn.id, "critical defender");
+        continue;
+    }
+
+    // --- Step 3: branch split ---
+    const myBlock = isOnBlockedOpponentYellow(btn, attacked, buttons, opponentColor);
+
+    if (myBlock) {
+        // =========================================
+        // BRANCH A: button sits on a blocked yellow
+        // =========================================
+
+        // --- Step 4: cover checks ---
+        const hasFellowCover = hasFellows;
+
+        let hasGoalBlockerCover = false;
+        if (isGoalBlocker(btn)) {
+            const buttonBehind = getButtonBehindGoalBlocker();
+            if (buttonBehind &&
+                buttonBehind.col === ownColor &&
+                isLinkedToCompAns(buttonBehind)) {
+                hasGoalBlockerCover = true;
             }
-            
-            const fellowOnBlocked = blockedYellow
-                ? fellows.find(f =>
-                    f.x === blockedYellow.x + 3 &&
-                    f.y === blockedYellow.y + 3
-                  )
-                : null;
-            
-            // No fellow on blocked yellow → skip
-            if (!fellowOnBlocked) continue;
-            if (l >= 1) return;
-            
-            // Fellow on blocked yellow → exempt it
-            exemptButtons.add(fellowOnBlocked);
-            logExemptedButton(fellowOnBlocked.id,
-                "fellow multi-attacker on blocked yellow " + blockedYellow.id);
         }
-        
-        // ===========================================
-        // YELLOW TARGET CHECK
-        // ===========================================
-        const yellowTarget = getAttackedYellow(btn);
-        if (yellowTarget) {
-            
-            if (yellowTarget !== compAns) continue;
-            
-            if (isCriticalDefender(btn) && l < 1) {
-                exemptButtons.add(btn);
-                logExemptedButton(btn.id, "critical defender");
-                continue;
+
+        if ((hasFellowCover || hasGoalBlockerCover)  &&
+                l < 1) {
+            // --- Step 5: exempt with appropriate log ---
+            exemptButtons.add(btn);
+            if (hasFellowCover) {
+                logExemptedButton(btn.id, "holding blocked yellow " + myBlock.yellow.id);
+            } else {
+                logExemptedButton(btn.id, "goal blocker stays (token behind moves)");
             }
-            
-            if (isGoalBlocker(btn)) {
-                const buttonBehind = getButtonBehindGoalBlocker();
-                if (buttonBehind && buttonBehind.col === ownColor) {
-                    if (isLinkedToCompAns(buttonBehind) && l < 1) {
-                        exemptButtons.add(btn);
-                        logExemptedButton(btn.id, "goal blocker stays (token behind " + buttonBehind.id + " moves)");
-                        continue;
-                    }
+        } else {
+            // --- Step 6: single-attacker branch ---
+            const secondWing =
+                (myBlock.yellow === attacked[4]) ? attacked[5] : attacked[4];
+
+            let singleCoversSecondWing = false;
+            for (let other of buttons) {
+                if (other.col !== ownColor) continue;
+                if (other === btn) continue;
+                if (isMultiAttacker(other)) continue;
+                if (getFellowMultiAttackers(other).length > 0) continue;
+                if (canReach(other, secondWing)) {
+                    singleCoversSecondWing = true;
+                    break;
                 }
             }
-            
-            const safeBackup = hasSafeBackupForYellow(btn, yellowTarget);
-            if (safeBackup && l < 1 && safeNumbers && safeNumbers.length > 0) {
+
+            const safeBackup = hasSafeBackupForYellow(btn, myBlock.yellow);
+            const hasSafeMove = (safeNumbersCount > 0);
+
+            if (secondWing.occupancy === 'no' &&
+                singleCoversSecondWing &&
+                safeBackup &&
+                l < 1 &&
+                hasSafeMove) {
+                // --- Step 7: exempt ---
                 exemptButtons.add(btn);
-                logExemptedButton(btn.id, "single multi-attacker with safe backup attacking "+yellowTarget.id);
-                continue;
-            } 
-            else {
-                continue;
+                logExemptedButton(btn.id, "single attacker on second wing yellow");
+            }
+            // --- Step 8: otherwise, no exemption ---
+        }
+    } else {
+        // =========================================
+        // BRANCH B: fellow multi-attacker NOT on a blocked yellow
+        // =========================================
+
+        // --- Step 9: only if btn has fellows ---
+        if (!hasFellows) continue;
+
+        // --- Step 10: look for a fellow on a blocked yellow ---
+        let fellowOnBlocked = null;
+        let fellowBlockInfo = null;
+        for (let f of fellows) {
+            const fb = isOnBlockedOpponentYellow(f, attacked, buttons, opponentColor);
+            if (fb) {
+                fellowOnBlocked = f;
+                fellowBlockInfo = fb;
+                break;
             }
         }
+
+        if (l < 1 && fellowOnBlocked) {
+            // --- Step 11: exempt the fellow, not btn ---
+            exemptButtons.add(fellowOnBlocked);
+            logExemptedButton(
+                fellowOnBlocked.id,
+                "fellow multi-attacker on blocked yellow " + fellowBlockInfo.yellow.id
+            );
+        }
+        // --- Step 12: otherwise, no exemption ---
     }
 }
 
 
-// ✅ Only run strategic numbers exemption if there are safe numbers available
-if (advAns === 1 && l < 1) {
+// ===========================================
+// STRATEGIC NUMBERS EXEMPTION
+// Runs after Rule 1. Exempts the sole attacker
+// of a strategic white square when that attacker
+// is not already protected by fellow multi-attackers.
+// ===========================================
+if (advAns === 1 && l < 2) {
     const strategicNumbers = [attacked[0], attacked[1], attacked[2]];
 
     strategicNumbers.forEach((targetCell) => {
         if (!targetCell || targetCell.occupancy === 'yes') return;
-        
+
         const buttonsThatCanReach = [];
         const directions = ['right', 'left', 'up', 'down', 'up-left', 'down-left', 'up-right', 'down-right'];
-        
+
         directions.forEach(d => {
             const dirResult = categorizeButtonsByDirection(targetCell);
             if (dirResult && dirResult[d] && dirResult[d][0]) {
@@ -10390,17 +10816,18 @@ if (advAns === 1 && l < 1) {
                 }
             }
         });
-        
-        if (buttonsThatCanReach.length < 1) return;
-        
+
+        // Only exempt when EXACTLY one button can attack this square.
+        if (buttonsThatCanReach.length !== 1) return;
+
         const closestButton = buttonsThatCanReach[0];
-        
-        // ✅ Only exempt if NOT a fellow multi-attacker
+
+        // Skip if this attacker is a multi-attacker with backup.
         const fellows = getFellowMultiAttackers(closestButton);
-        if (fellows.length === 1) {
-            exemptButtons.add(closestButton);
-            logExemptedButton(closestButton.id, `maintaining attack on number ${targetCell.id}`);
-        }
+        if (fellows.length > 0) return;
+
+        exemptButtons.add(closestButton);
+        logExemptedButton(closestButton.id, `maintaining attack on number ${targetCell.id}`);
     });
 }
 
@@ -10596,7 +11023,7 @@ if (l < 1) {
             cell.y === blockingButton.y - 3
         );
 
-        if (blockerCell && hasOpponentLink(blockerCell)) {
+        if (blockerCell) {
 
             const isDown = dir === "down";
 
@@ -10620,33 +11047,34 @@ if (l < 1) {
             // ===========================================
             let newRuleApplies = false;
 
-            if (factorCanReach(blockerCell.id, vulFac)) {
-                const betweenCell = answer.find(cell =>
-                    cell.x === positions[3].x &&
-                    cell.occupancy === 'no' &&
-                    (isDown
-                        ? cell.y + 3 < blockingButton.y && cell.y > positions[3].y
-                        : cell.y + 3 > blockingButton.y && cell.y < positions[3].y)
-                );
+            if (factorCanReach(blockerCell.id, vulFac) && hasOpponentLink(blockerCell)) {
+    const betweenCell = answer.find(cell =>
+        cell.x === positions[3].x &&
+        cell.occupancy === 'no' &&
+        (isDown
+            ? cell.y + 3 < blockingButton.y && cell.y > positions[3].y
+            : cell.y + 3 > blockingButton.y && cell.y < positions[3].y)
+    );
 
-                if (!betweenCell) {
-                    newRuleApplies = true;
-                } else if (hasOpponentLink(betweenCell)) {
-                    const defFac = factorOf(blockerCell.id);
-                    const canReachBetween = defFac && factorCanReach(betweenCell.id, defFac);
+    if (!betweenCell) {
+        newRuleApplies = true;
+    } else {
+        const betweenDir = categorizeButtonsByDirection(betweenCell);
+        const ownLinked = directionsToCheck.some(d =>
+            betweenDir?.[d]?.[0]?.col === ownColor
+        );
 
-                    if (!canReachBetween) {
-                        newRuleApplies = true;
-                    } else {
-                        // own button linked to betweenCell?
-                        const betweenDir = categorizeButtonsByDirection(betweenCell);
-                        const ownLinked = directionsToCheck.some(d =>
-                            betweenDir?.[d]?.[0]?.col === ownColor
-                        );
-                        if (!ownLinked) newRuleApplies = true;
-                    }
-                }
+        if (ownLinked) {
+            const defFac = factorOf(blockerCell.id);
+            const canReachBetween = defFac && factorCanReach(betweenCell.id, defFac);
+            if (!canReachBetween) {
+                newRuleApplies = true;
             }
+        } else {
+            newRuleApplies = true;
+        }
+    }
+}
 
             // ===========================================
             // PART 3 — THIRD CONDITION: exempt midBut
@@ -10654,8 +11082,7 @@ if (l < 1) {
             // ===========================================
             let thirdRuleApplies = false;
             let thirdRuleYellow = null;
-
-            if (isLinkedToCompAns(midBut)) {
+            if(blockingButton.x === positions[2].x+3 && blockingButton.y === positions[2].y+3 && isLinkedToCompAns(midBut)) {
                 const mirrors = [
                     { yellow: positions[5], white: positions[1] },
                     { yellow: positions[4], white: positions[0] },
@@ -10668,7 +11095,7 @@ if (l < 1) {
                     const defFac = factorOf(yellow.id);
                     if (!defFac) continue;
 
-                    if (!factorCanReach(white.id, defFac)) {
+                    if (factorCanReach(white.id, defFac)) {
                         thirdRuleApplies = true;
                         thirdRuleYellow = yellow;
                         break;
@@ -10687,9 +11114,137 @@ if (l < 1) {
                 exemptButtons.add(midBut);
                 logExemptedButton(midBut.id, "mid button support for " + thirdRuleYellow.id);
             }
+        // ===========================================
+            // PART B — GOAL LINE VULNERABILITY (Back Door)
+            // Merged: B1–B3 use goal blocker variables;
+            //         B4 down keeps Part B's own variables
+            // ===========================================
+
+            // Is compAns between the blocker and the mid button?
+            const anyBut = goalChk?.[dir]?.[1];
+
+    if (blockingButton && anyBut) {
+    const anyNum = answer.find(cell =>
+                cell.x === positions[3].x &&
+                cell.x + 3 === blockingButton.x && cell.x + 3 === anyBut.x &&
+                (isDown
+                    ? cell.y + 3 > blockingButton.y && cell.y + 3 < anyBut.y
+                    : cell.y + 3 < blockingButton.y && cell.y + 3 > anyBut.y) &&
+                factorCanReach(cell.id, vulFac)
+            );
+            // Is compAns between the blocker and the mid button?
+            const isCompAnsBetween = (isDown) ?
+                (compAns.y + 3 > blockingButton.y && compAns.y + 3 < anyBut.y) :
+                (compAns.y + 3 < blockingButton.y && compAns.y + 3 > anyBut.y);
+
+            if (isCompAnsBetween && anyNum) {
+
+                // B1: midNum reachable via vulFac
+                if (factorCanReach(anyNum.id, vulFac)) {
+
+                    // B2: opponent has a first-button link to midNum
+                    const cellDir = categorizeButtonsByDirection(anyNum);
+                    let hasOpponentLinkToMid = false;
+                    let opponentButton = null;
+                    for (let d of directionsToCheck) {
+                        if (cellDir && cellDir[d] && cellDir[d][0] &&
+                            cellDir[d][0].col === opponentColor) {
+                            hasOpponentLinkToMid = true;
+                            opponentButton = cellDir[d][0];
+                            break;
+                        }
+                    }
+
+                    if (hasOpponentLinkToMid) {
+
+                        // PREVENTIVE SKIP: compAns physically blocks the path
+                        const compAnsBlocksPath = (isDown)
+                            ? (compAns.y + 3 > positions[3].y && compAns.y + 3 < anyNum.y)
+                            : (compAns.y + 3 < positions[3].y && compAns.y + 3 > anyNum.y);
+
+                        if (!compAnsBlocksPath) {
+
+                            // B4: find blocking cell between own goal and midNum
+                            const blockingCell = answer.find(block =>
+                                block.x === positions[3].x && compAns.id !== block.id &&
+                                ((dir === "down") ?
+                                    (block.y > positions[3].y && block.y + 3 < anyNum.y) :
+                                    (block.y < positions[3].y && block.y + 3 > anyNum.y)) && block !== positions[3]
+                            );
+
+                            // B5: no blocking cell → exempt blockingButton
+                            if (!blockingCell) {
+                                if (!canBlockAttack(compAns, opponentButton, anyNum)) {
+                                    exemptButtons.add(blockingButton);
+                                    logExemptedButton(blockingButton.id, "Blocking goal");
+                                }
+                            } else {
+
+                                // B6: check blocking cell's own link and criticality
+                                const blockingCellDir = categorizeButtonsByDirection(blockingCell);
+let hasOwnButtonLinkedToBlocker = false;
+let isBlockerLinkedToCritical = false;
+for (let d of directionsToCheck) {
+    const candidateBtn = blockingCellDir && blockingCellDir[d] && blockingCellDir[d][0];
+    if (candidateBtn &&
+        candidateBtn.col === ownColor &&
+        candidateBtn !== blockingButton) {
+
+        hasOwnButtonLinkedToBlocker = true;
+
+        // Exempt the linked button — it must stay to keep blocking
+        exemptButtons.add(candidateBtn);
+        logExemptedButton(candidateBtn.id, "Blocking goal");
+
+        if (isCriticalDefender(candidateBtn)) {
+            isBlockerLinkedToCritical = true;
+        }
+        break;
+    }
+}
+
+                                // B7: no own link OR blocker linked to critical → exempt blockingButton
+                                if (!hasOwnButtonLinkedToBlocker || isBlockerLinkedToCritical) {
+                                    exemptButtons.add(blockingButton);
+                                    logExemptedButton(blockingButton.id, "Blocking goal");
+                                } else {
+
+                                    // B8: defensive factor from midNum
+                                    let defFacGL = null;
+                                    if (anyNum.id >= vulFac && anyNum.id % vulFac === 0 && anyNum.id / vulFac <= 9) {
+                                        defFacGL = anyNum.id / vulFac;
+                                    } else if (anyNum.id < vulFac && vulFac % anyNum.id === 0) {
+                                        defFacGL = vulFac / anyNum.id;
+                                    }
+
+                                    if (defFacGL) {
+                                        // B9: can blocking cell be reached
+                                        const canBlock = (blockingCell.id >= defFacGL && blockingCell.id % defFacGL === 0 && blockingCell.id / defFacGL <= 9) ||
+                                                         (blockingCell.id < defFacGL && defFacGL % blockingCell.id === 0);
+
+                                        // B10: cannot block → exempt blockingButton
+                                        if (!canBlock) {
+                                            exemptButtons.add(blockingButton);
+                                            logExemptedButton(blockingButton.id, "Blocking goal");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
+
+if (positions[2].occupancy === "no" && compAns.id !== positions[2].id &&
+    ((positions[2].id >= vulFac && positions[2].id % vulFac === 0 && positions[2].id / vulFac <= 9) ||
+     (positions[2].id < vulFac && vulFac % positions[2].id === 0))) {
+
+    exposeCollinearThreat(positions[2]);
+    }
 
 // #5 Left White defensive
 if (positions[0].occupancy === "no" && compAns.id !== positions[0].id &&
@@ -10704,7 +11259,7 @@ if (positions[0].occupancy === "no" && compAns.id !== positions[0].id &&
         const ownButton = btnDir1 && btnDir1[d] && btnDir1[d][0];
         const opponentButton = btnDir1 && btnDir1[d] && btnDir1[d][1];
         
-        if (ownButton && ownButton.col === ownColor &&
+        if (ownButton && ownButton.col === ownColor && isLinkedToCompAns(ownButton) &&
             opponentButton && opponentButton.col === opponentColor) {
             supportingGoalBlock(opponentButton, positions[0]); 
             if (areCollinear(ownButton, opponentButton, compAns, positions[0])) {
@@ -10733,7 +11288,7 @@ if (positions[1].occupancy === "no" && compAns.id !== positions[1].id &&
         const ownButton = btnDir2 && btnDir2[d] && btnDir2[d][0];
         const opponentButton = btnDir2 && btnDir2[d] && btnDir2[d][1];
         
-        if (ownButton && ownButton.col === ownColor &&
+        if (ownButton && ownButton.col === ownColor && isLinkedToCompAns(ownButton) && 
             opponentButton && opponentButton.col === opponentColor) {
             supportingGoalBlock(opponentButton, positions[1]);   
             if (areCollinear(ownButton, opponentButton, compAns, positions[1])) {
@@ -10758,7 +11313,7 @@ positions.forEach((pos, idx) => {
             if (occBtnDir && occBtnDir[direction] && occBtnDir[direction][0] && 
                 occBtnDir[direction][0].col === opponentColor) {
                 const occuBut = buttons.find(button => button.x === pos.x + 3 && button.y === pos.y + 3 && button.col === ownColor);
-                if (occuBut) {
+                if (occuBut && isLinkedToCompAns(occuBut)) {
                     if (idx === 0) occWhite1 = occuBut;
                     if (idx === 1) occWhite2 = occuBut;
                     if (idx === 2) occMouth = occuBut;
@@ -10801,7 +11356,7 @@ if (yellowSquare5 && yellowSquare5.occupancy === 'yes') {
         btn.col === ownColor
     );
 
-    if (yellowButton5 && blockVulForYellow5 && blockVulForYellow5.occupancy === 'no') {
+    if (yellowButton5 && isLinkedToCompAns(yellowButton5) && blockVulForYellow5 && blockVulForYellow5.occupancy === 'no') {
 
         // --- REQUIRED: opponent must be linked to the yellow ---
         const yellowDir = categorizeButtonsByDirection(yellowSquare5);
@@ -10871,7 +11426,7 @@ if (yellowSquare5 && yellowSquare5.occupancy === 'yes') {
                             if (!defFacCannotBlock) {
                                 supportingGoalBlock(oppBut, positions[5]);   
                             }
-                            if (occuBlock && l<1) {
+                            if (occuBlock && isLinkedToCompAns(occuBlock) && l<1) {
                                 exemptButtons.add(occuBlock);
                                 logExemptedButton(occuBlock.id, "occupying "+positions[1].id);
                             }
@@ -10899,7 +11454,7 @@ if (yellowSquare5 && yellowSquare5.occupancy === 'yes') {
                     if (ownButton && ownButton.col === ownColor &&
                         opponentButton && opponentButton.col === opponentColor && l<1) {
                         
-                        if (areCollinear(ownButton, opponentButton, compAns, positions[5])) {
+                        if (!isLinkedToCompAns(ownButton) || areCollinear(ownButton, opponentButton, compAns, positions[5])) {
                             continue;
                         } else {
                             defYellow2 = ownButton;
@@ -10932,7 +11487,7 @@ if (yellowSquare4 && yellowSquare4.occupancy === 'yes') {
         btn.col === ownColor
     );
 
-    if (yellowButton4 && blockVulForYellow4 && blockVulForYellow4.occupancy === 'no') {
+    if (yellowButton4 && isLinkedToCompAns(yellowButton4) && blockVulForYellow4 && blockVulForYellow4.occupancy === 'no') {
 
         // --- REQUIRED: opponent must be linked to the yellow ---
         const yellowDir = categorizeButtonsByDirection(yellowSquare4);
@@ -11002,7 +11557,7 @@ if (yellowSquare4 && yellowSquare4.occupancy === 'yes') {
                             if (!defFacCannotBlock) {
                                 supportingGoalBlock(oppBut, positions[4]);   
                             }
-                            if (occuBlock && l<1) {
+                            if (occuBlock && isLinkedToCompAns(occuBlock) && l<1) {
                                 exemptButtons.add(occuBlock);
                                 logExemptedButton(occuBlock.id, "occupying "+positions[0].id);
                             }
@@ -11030,7 +11585,7 @@ if (yellowSquare4 && yellowSquare4.occupancy === 'yes') {
                     if (ownButton && ownButton.col === ownColor &&
                         opponentButton && opponentButton.col === opponentColor && l<1) {
                         
-                        if (areCollinear(ownButton, opponentButton, compAns, positions[4])) {
+                        if (!isLinkedToCompAns(ownButton) || areCollinear(ownButton, opponentButton, compAns, positions[4])) {
                             continue;
                         } else {
                             defYellow1 = ownButton;
@@ -11493,7 +12048,7 @@ for (let whiteSquare of whiteSquares) {
         continue;
     }
     
-    if (!canBlockAttack(ansList, opponentButton, whiteSquare) && l < 3) {
+    if (!canBlockAttack(ansList, opponentButton, whiteSquare) && l < 2) {
         exemptAnswers.add(ansList);
         logExemptedNumber(ansList.id, "to protect "+whiteSquare.id);
     }
@@ -11602,16 +12157,18 @@ function isOpponentBlockingOwnGoal(opponentButton) {
 }
 
 // ===========================================
-// GOAL LINE VULNERABILITY EXEMPTION (#6 & #7) - FULL
+// SHARED UPPER SCOPE
 // ===========================================
+// Establishes vulFac, goalMouth, goalMouthDirection, firstOwnButton
+// so that PART A and PART B can both consume them.
 
-// Step 1: Validate the vulnerability factor
-if (!vulFac || vulFac < 1 || vulFac > 81) {
+// Step 1: validate vulFac
+if (!vulFac || vulFac < 1 || vulFac > 9) {
     console.warn('vulFac invalid, skipping exemption');
     return;
 }
 
-// Step 2: Get the goal mouth and direction
+// Step 2: get the goal mouth and direction
 const goalMouth = positions[3];
 if (!goalMouth) return;
 
@@ -11620,29 +12177,28 @@ const firstOwnButton = goalMouthDirection && goalMouthDirection[dir] && goalMout
 
 if (!firstOwnButton || firstOwnButton.col !== ownColor) return;
 
-// ===========================================
-// PART A: ORIGINAL VULNERABILITY CHECK (Front Door)
-// ===========================================
-const vulnerableCellsA = answer.filter(cell => 
-    cell.x === goalMouth.x && ansList.id !== cell.id &&
+const vulnerableCellsA = answer.filter(cell =>
+    cell.x === goalMouth.x &&
+    ansList.id !== cell.id &&
     ((dir === "down") ?
-        (cell.y > goalMouth.y && cell.y + 3 < firstOwnButton.y) :
-        (cell.y < goalMouth.y && cell.y + 3 > firstOwnButton.y)) &&
-    cell.occupancy === 'no'
+        (cell.y + 3 < firstOwnButton.y && cell.y > goalMouth.y) :
+        (cell.y + 3 > firstOwnButton.y && cell.y < goalMouth.y)) &&
+    cell.occupancy === 'no' && cell !== positions[3]
 );
 
 for (let cell of vulnerableCellsA) {
-    // Condition 1: Check if cell can be accessed via factor
+
+    // Condition 1: cell reachable via vulFac
     const canAccess = (cell.id >= vulFac && cell.id % vulFac === 0 && cell.id / vulFac <= 9) ||
                       (cell.id < vulFac && vulFac % cell.id === 0);
     if (!canAccess) continue;
-    
-    // Condition 2: Check if opponent has a link to this cell
+
+    // Condition 2: opponent has a first-button link to this cell
     const cellDir = categorizeButtonsByDirection(cell);
     let hasOpponentLink = false;
     let opponentButton = null;
     for (let d of allDirections) {
-        if (cellDir && cellDir[d] && cellDir[d][0] && 
+        if (cellDir && cellDir[d] && cellDir[d][0] &&
             cellDir[d][0].col === opponentColor) {
             hasOpponentLink = true;
             opponentButton = cellDir[d][0];
@@ -11650,44 +12206,44 @@ for (let cell of vulnerableCellsA) {
         }
     }
     if (!hasOpponentLink) continue;
-    
-    // Condition 3: Check if ansList is linked to a critical defender
-    const ansDir = categorizeButtonsByDirection(ansList);
+
+    // Condition 3: ansList links to a critical defender
+    const ansDir8 = categorizeButtonsByDirection(ansList);
     let linkedButton = null;
     for (let d of allDirections) {
-        if (ansDir && ansDir[d] && ansDir[d][0] && ansDir[d][0].col === ownColor) {
-            linkedButton = ansDir[d][0];
+        if (ansDir8 && ansDir8[d] && ansDir8[d][0] && ansDir8[d][0].col === ownColor) {
+            linkedButton = ansDir8[d][0];
             break;
         }
     }
     const isLinkedToCritical = linkedButton && isCriticalDefender(linkedButton);
-    
-    // Condition 4: Find blocking cell
-    const blockingCell = answer.find(block => 
+
+    // Condition 4: find blocking cell (between goal and vulnerable cell)
+    const blockingCell = answer.find(block =>
         block.x === goalMouth.x && ansList.id !== block.id &&
         ((dir === "down") ?
             (block.y < cell.y && block.y > goalMouth.y) :
             (block.y > cell.y && block.y < goalMouth.y)) &&
-        block.occupancy === 'no'
+    block.occupancy === 'no' && block !== positions[3]
     );
-    
-    // Condition 5: No blocking cell
+
+    // Condition 5: no blocking cell → exempt
     if (!blockingCell) {
-        if(l < 1 && (!canBlockAttack(ansList, opponentButton, cell) || isLinkedToCritical)) {
+        if (l < 1 && !canBlockAttack(ansList, opponentButton, cell)) {
             exemptAnswers.add(ansList);
-            logExemptedNumber(ansList.id, "no blocking cell for own goal");
+            logExemptedNumber(ansList.id, "Blocking goal");
         }
         continue;
     }
-    
-    // Condition 6: Check if blocking cell has own button linked AND if it's critical
+
+    // Condition 6: check blocking cell's own link and criticality
     const blockingCellDir = categorizeButtonsByDirection(blockingCell);
     let hasOwnButtonLinkedToBlocker = false;
     let isBlockerLinkedToCritical = false;
     for (let d of allDirections) {
-        if (blockingCellDir && blockingCellDir[d] && blockingCellDir[d][0] && 
+        if (blockingCellDir && blockingCellDir[d] && blockingCellDir[d][0] &&
             blockingCellDir[d][0].col === ownColor &&
-                    blockingCellDir[d][0] !== firstOwnButton) {
+            blockingCellDir[d][0] !== firstOwnButton) {
             hasOwnButtonLinkedToBlocker = true;
             if (isCriticalDefender(blockingCellDir[d][0])) {
                 isBlockerLinkedToCritical = true;
@@ -11695,17 +12251,17 @@ for (let cell of vulnerableCellsA) {
             break;
         }
     }
-    
-    // Condition 7: No own button linked to blocker OR blocker is linked to critical defender
-    if (!hasOwnButtonLinkedToBlocker || isBlockerLinkedToCritical) {
-        if(l < 1 && (!canBlockAttack(ansList, opponentButton, cell) || isLinkedToCritical)) {
+
+    // Condition 7: no own link OR blocker linked to critical → exempt
+    if (l < 1 && (!hasOwnButtonLinkedToBlocker || isBlockerLinkedToCritical)) {
+        if (!canBlockAttack(ansList, opponentButton, cell)) {
             exemptAnswers.add(ansList);
-            logExemptedNumber(ansList.id, "blocking cell has no own token linked or is critical");
+            logExemptedNumber(ansList.id, "Blocking goal");
         }
         continue;
     }
-    
-    // Condition 8: Calculate defensive factor
+
+    // Condition 8: defensive factor
     let defFacGL = null;
     if (cell.id >= vulFac && cell.id % vulFac === 0 && cell.id / vulFac <= 9) {
         defFacGL = cell.id / vulFac;
@@ -11713,139 +12269,25 @@ for (let cell of vulnerableCellsA) {
         defFacGL = vulFac / cell.id;
     }
     if (!defFacGL) continue;
-    
-    // Condition 9: Check if blocking cell can be reached
+
+    // Condition 9: can blocking cell be reached
     const canBlock = (blockingCell.id >= defFacGL && blockingCell.id % defFacGL === 0 && blockingCell.id / defFacGL <= 9) ||
                      (blockingCell.id < defFacGL && defFacGL % blockingCell.id === 0);
-    
-    // Condition 10: Cannot block
-    if (!canBlock) {               
-        if (l < 1 && (!canBlockAttack(ansList, opponentButton, cell) || isLinkedToCritical)) {
+
+    // Condition 10: cannot block → exempt
+    if (l < 1 && !canBlock) {
+        if (!canBlockAttack(ansList, opponentButton, cell)) {
             exemptAnswers.add(ansList);
-            logExemptedNumber(ansList.id, "cannot reach blocking cell");
+            logExemptedNumber(ansList.id, "Blocking goal");
         }
     }
 }
 
-// ===========================================
-// PART B: OWN GOAL VULNERABILITY CHECK (Back Door)
-// ===========================================
-// Scenario:
-// Before: Opponent goal → Own goal blocker → ansList → Opponent button → (further away)
-// After:  Opponent goal → (empty) → Own goal blocker (moved to ansList) → Opponent button
-
-const secondButton = goalMouthDirection && goalMouthDirection[dir] && goalMouthDirection[dir][1];
-
-// Check if the second button is an OPPONENT button (behind the own goal blocker)
-if (secondButton && secondButton.col === opponentColor) {
-    
-    // Check if ansList is BETWEEN the own goal blocker (first) and the opponent button (second)
-    const isAnsListBetween = (dir === "down") ?
-        (ansList.y + 3 > firstOwnButton.y && ansList.y + 3 < secondButton.y) :
-        (ansList.y + 3 < firstOwnButton.y && ansList.y + 3 > secondButton.y);
-    
-    if (isAnsListBetween) {
-        
-        // If the own goal blocker moves to ansList, the cells behind it become vulnerable
-        // Find vulnerable cells BETWEEN the own goal and the own goal blocker
-        const ownGoal = positions[3];
-        const vulnerableCellsB = answer.filter(cell => 
-            cell.x === ownGoal.x && ansList.id !== cell.id &&
-            ((dir === "down") ?
-                (cell.y > ownGoal.y && cell.y + 3 < ansList.y) :
-                (cell.y < ownGoal.y && cell.y + 3 > ansList.y))
-        );
-        
-        for (let cell of vulnerableCellsB) {
-            
-            // ✅ CHECK B1: canAccess - Vulnerable cell must be reachable via factor
-            const canAccess = (cell.id >= vulFac && cell.id % vulFac === 0 && cell.id / vulFac <= 9) ||
-                              (cell.id < vulFac && vulFac % cell.id === 0);
-            if (!canAccess) continue;
-            
-            // ✅ CHECK B2: hasOpponentLink - Opponent must have a link to this vulnerable cell
-            const cellDir = categorizeButtonsByDirection(cell);
-            let hasOpponentLink = false;
-            let opponentButton = null;
-            for (let d of allDirections) {
-                if (cellDir && cellDir[d] && cellDir[d][0] && 
-                    cellDir[d][0].col === opponentColor) {
-                    hasOpponentLink = true;
-                    opponentButton = cellDir[d][0];
-                    break;
-                }
-            }
-            if (!hasOpponentLink) continue;
-            
-                        // ✅ CHECK B4: Find blocking cell (between own goal and vulnerable cell)
-            const blockingCell = answer.find(block => 
-                block.x === ownGoal.x && ansList.id !== block.id && 
-                ((dir === "down") ?
-                    (block.y > ownGoal.y && block.y + 3 < cell.y) :
-                    (block.y < ownGoal.y && block.y + 3 > cell.y)) 
-            );
-            
-            // ✅ CHECK B5: No blocking cell → EXEMPT
-            if (!blockingCell) {
-                if(l < 1 && (!canBlockAttack(ansList, opponentButton, cell))) {
-                    exemptAnswers.add(ansList);
-                    logExemptedNumber(ansList.id, "no blocking cell");
-                }
-                continue;
-            }
-            
-            // ✅ CHECK B6: Check if blocking cell has own button linked and if it's critical
-            const blockingCellDir = categorizeButtonsByDirection(blockingCell);
-            let hasOwnButtonLinkedToBlocker = false;
-            let isBlockerLinkedToCritical = false;
-            for (let d of allDirections) {
-                if (blockingCellDir && blockingCellDir[d] && blockingCellDir[d][0] && 
-                    blockingCellDir[d][0].col === ownColor &&
-                    blockingCellDir[d][0] !== firstOwnButton) {  // Not the own goal blocker
-                    hasOwnButtonLinkedToBlocker = true;
-                    if (isCriticalDefender(blockingCellDir[d][0])) {
-                        isBlockerLinkedToCritical = true;
-                    }
-                    break;
-                }
-            }
-            
-            // ✅ CHECK B7: No own button linked OR blocker is linked to critical → EXEMPT
-            if(l < 1 && (!hasOwnButtonLinkedToBlocker || isBlockerLinkedToCritical)) {
-                
-                    exemptAnswers.add(ansList);
-                    logExemptedNumber(ansList.id, "blocking cell has no own token linked or is critical");
-                
-                continue;
-            }
-            
-            // ✅ CHECK B8: Calculate defensive factor
-            let defFacGL = null;
-            if (cell.id >= vulFac && cell.id % vulFac === 0 && cell.id / vulFac <= 9) {
-                defFacGL = cell.id / vulFac;
-            } else if (cell.id < vulFac && vulFac % cell.id === 0) {
-                defFacGL = vulFac / cell.id;
-            }
-            if (!defFacGL) continue;
-            
-            // ✅ CHECK B9: Check if blocking cell can be reached via defensive factor
-            const canBlock = (blockingCell.id >= defFacGL && blockingCell.id % defFacGL === 0 && blockingCell.id / defFacGL <= 9) ||
-                             (blockingCell.id < defFacGL && defFacGL % blockingCell.id === 0);
-            
-            // ✅ CHECK B10: Cannot block → EXEMPT
-            if (l < 1 && !canBlock) {               
-                    exemptAnswers.add(ansList);
-                    logExemptedNumber(ansList.id, "cannot reach blocking cell");
-                
-            }
-        }
-    }
-}
 
 // ===========================================
 // MAIN UNIFIED EXEMPTION LOOP
 // ===========================================
-if (!vulFac || vulFac < 1 || vulFac > 81) {
+if (!vulFac || vulFac < 1 || vulFac > 9) {
     console.warn('vulFac invalid, skipping exemption');
     return;
 }
@@ -11877,15 +12319,18 @@ for (let i = 0; i < yellowSquares.length; i++) {
             const blockVulDir = categorizeButtonsByDirection(blockVul);
             let hasOwnButtonLinkedToBlockVul = false;
             const directions = ['right', 'left', 'up', 'down', 'up-left', 'down-left', 'up-right', 'down-right'];
+            let blockVulButton = null;
             
             for (let dir of directions) {
                 if (blockVulDir && blockVulDir[dir] && blockVulDir[dir][0] && 
                     blockVulDir[dir][0].col === ownColor) {
                     hasOwnButtonLinkedToBlockVul = true;
+                    blockVulButton = blockVulDir[dir][0];
                     break;
                 }
             }
             
+           const isBlockVulButtoncritical = (blockVulButton && isCriticalDefender(blockVulButton));
             const ansDir = categorizeButtonsByDirection(ansList);
             let linkedButton = null;
             for (let dir of allDirections) {
@@ -11909,7 +12354,7 @@ for (let i = 0; i < yellowSquares.length; i++) {
                 }
             }
             
-            if ( l < 3 && hasOpponentClosest && canReachYellow  && (!hasOwnButtonLinkedToBlockVul || isLinkedToCriticalButton)) {
+            if ( l < 3 && hasOpponentClosest && canReachYellow  && (!hasOwnButtonLinkedToBlockVul || isBlockVulButtoncritical || isLinkedToCriticalButton)) {
                 exemptAnswers.add(ansList);
                 logExemptedNumber(ansList.id, "no own token to block");
             }
@@ -11925,7 +12370,7 @@ const opponentGoalCheck = attacked[3];
                 isOpponentBlockingOwnGoalLocal = true;
             }
             
-            if (hasOpponentClosest && canReachYellow && defFac && l < 2) {
+            if (hasOpponentClosest && canReachYellow && defFac && l < 3) {
                 const cannotBlock = !canReachBlockVul;
                 
                 if (cannotBlock) {
@@ -11968,7 +12413,7 @@ const opponentGoalCheck = attacked[3];
                 let linkedOpponent = null;
                 let threatType = null;
 
-                if (!vulFac || vulFac < 1 || vulFac > 81) {
+                if (!vulFac || vulFac < 1 || vulFac > 9) {
                     console.warn('vulFac invalid, skipping exemption');
                     return;
                 }
@@ -12032,7 +12477,7 @@ const opponentGoalCheck = attacked[3];
     if (targetedYellow) break;
 }
                 
-                if (!defFac || defFac < 1 || defFac > 81) {
+                if (!defFac || defFac < 1 || defFac > 9) {
                     continue;
                 }
                 
@@ -12088,11 +12533,11 @@ else {
                 }
             }
 
-            if (!vulFac || vulFac < 1 || vulFac > 81) {
+            if (!vulFac || vulFac < 1 || vulFac > 9) {
                 return;
             }
             
-            if (!defFac || defFac < 1 || defFac > 81) {
+            if (!defFac || defFac < 1 || defFac > 9) {
                 continue;
             }
             
@@ -12204,7 +12649,7 @@ else {
 // ===========================================
 // WING YELLOW EXEMPTION (#8A & #8B) - INSIDE forEach loop
 // ===========================================
-if (!vulFac || vulFac < 1 || vulFac > 81) {
+if (!vulFac || vulFac < 1 || vulFac > 9) {
     console.warn('vulFac invalid, skipping exemption');
     return;
 }
@@ -12248,7 +12693,7 @@ if (positions[4] && positions[5] &&
                     const defFacCanReachWhite0 = (positions[0].id >= defFac && positions[0].id % defFac === 0 && positions[0].id / defFac <= 9) ||
                                                   (positions[0].id < defFac && defFac % positions[0].id === 0);
                     
-                    if (!defFac || defFac < 1 || defFac > 81) {
+                    if (!defFac || defFac < 1 || defFac > 9) {
                         continue;
                     }
 
@@ -12436,7 +12881,7 @@ function strictMove() {
 // ============================================================
 
 function makeMove() {
-    // ✅ Lock immediately
+    restZoneStartedForThisMove = false;
     if (window._moveExecuted) {
         console.warn('⚠️ Move already executed — skipping');
         return false;
@@ -12444,6 +12889,15 @@ function makeMove() {
     window._moveExecuted = true;
     animationInProgress = true;
     touchEnabled = false;
+
+    // ✅ Cancel any pending auto-move — we're executing one now
+    if (autoMoveTimer) {
+        clearTimeout(autoMoveTimer);
+        pendingDelays = pendingDelays.filter(e => e.id !== autoMoveTimer);
+        realTimeouts  = realTimeouts.filter(e => e.id !== autoMoveTimer);
+        autoMoveTimer = null;
+    }
+
 
     if (((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) || 
          (compAns.id < problemFactor && problemFactor % compAns.id == 0)) && 
@@ -12461,145 +12915,404 @@ function makeMove() {
         for (var f = 0; f < linkNum.length; f++) {
             logLinkedNumber(linkNum[f].id);
         }
+
+        let fullValid = [];
+        try { fullValid = (valAns() || []).slice(); } catch (e) { fullValid = []; }
+
+        const safeIds    = linkNum.map(cell => cell.id).sort((a, b) => a - b);
+        const safeSet    = new Set(safeIds);
+        const noGoIds    = fullValid.filter(id => !safeSet.has(id));
+        const exemptBtns = (currentLogData.exemptedButtons || []).map(e => e.id);
+
+        decisionSnapshot = {
+            valid: fullValid,
+            safe:  safeIds,
+            noGo:  noGoIds,
+            exemptButtons: exemptBtns
+        };
         
         const sourceCell = answer.find(cell => 
             cell.x === compBut.x - 3 && cell.y === compBut.y - 3
         );
-        
-        // ===========================================
-        // EDUCATIONAL STEPS - Using setTimeout like Code A
-        // ===========================================
-        
-        // Step 1: Frame valid numbers (1000ms)
-        setTimeout(() => {
-            if (g !== 1 && (g === 2 || g === 15)) {
-                selectedButton = targetButton;
-                selectedButtonLinks = [];
-                valAns();
-                findLinkedNumbersForButton(selectedButton);
-                generateNextTurnDisplay();
-                playSound(kick);
-                highlightButtonAndNumbers(selectedButton, selectedButtonLinks);
-            }
-        }, 1000);
-        
-        // Step 2: Touch feedback (4500ms)
-        setTimeout(() => {
-            if (g !== 1 && (g === 2 || g === 15)) {
-                playSound(kick);
+
+        // Step 1: highlight
+gameSetTimeoutReal(() => {
+    if (g !== 2 && g !== 15) return;
+
+    selectedButton = targetButton;
+    selectedButtonLinks = [];
+    valAns();
+    findLinkedNumbersForButton(selectedButton);
+    if (m > 1) generateNextTurnDisplay();
+    playSound(kick);
+    highlightButtonAndNumbers(selectedButton, selectedButtonLinks);
+
+    if (guessMode === 'guess' && matchInProgress) {
+        awaitingGuess = true;
+        pendingGuessCell = null;
+    }
+
+    // Step 2: guess window (unscaled — player-controlled)
+    const guessExtra = (guessMode === 'guess' && matchInProgress) ? guessWindowMs : 0;
+
+    gameSetTimeoutReal(() => {
+        // Step 3: hold, then arm
+        gameSetTimeoutReal(() => {
+            if (g !== 2 && g !== 15) return;
+
+            if (guessMode !== 'guess') {
+        showSimpleArm(compBut, compAns);
+    }
+
+            waitForAnimation(showSimpleArmIsRunning, () => {
                 ctx.fillStyle = 'rgba(0,0,0,0.6)';
                 ctx.fillRect(targetAnswer.x, targetAnswer.y, 51, 51);
-            }
-        }, 4500);
-        
-        // Step 3: Execute move (5000ms) - SAME AS CODE A
-        setTimeout(() => {
-            // Clear visual feedback
-            if (g !== 1 && (g === 2 || g === 15)) {
-                selectedButton = null;
-                selectedButtonLinks = [];
-                ctx.clearRect(0, 0, cW, cH);
-                renderAnswer();
-                renderButtons();
-                renderStats();
-                if (!matchInProgress) {
+                playSound(touch);
+
+                // Step 4: gap, then token slide
+                gameSetTimeoutReal(() => {
+                    if (g !== 2 && g !== 15) return;
+
+                    selectedButton = null;
+                    selectedButtonLinks = [];
+                    ctx.clearRect(0, 0, cW, cH);
+                    renderAnswer();
+                    renderButtons();
+                    renderStats();
                     statDraw(va, vb, vc, vd, ve, vf, vg, vh);
-                }
-            }
-            
-            // ===========================================
-            // ORIGINAL MOVE EXECUTION (from Code A)
-            // ===========================================
-            answer.forEach((origin) => {
-                if (targetButton.x == origin.x + 3 && targetButton.y == origin.y + 3) {
-                    origin.occupancy = "no";
-                    original = origin;
-                }
-            });
-            targetAnswer.occupancy = "yes";
 
-            let isComputer;
-            if (matchInProgress) {
-                if (side === 0) {
-                    isComputer = (r % 2 === 0);
-                } else {
-                    isComputer = (r % 2 !== 0);
-                }
-            } else {
-                isComputer = true;
-            }
-            
-            calculatePoints(isComputer);
-            
-            if (g !== 1 && (g === 2 || g === 15)) {
-                showSimpleArm(compBut, compAns);
-            }
-            
-            const isRedTurn2 = (r % 2 !== 0);
-            pointsEarnedThisMove = isRedTurn2 ? 
-                (redPoints - redBefore) : (bluePoints - blueBefore);
-            
-            let chanceType = "no chance";
-            if (pointsEarnedThisMove === 10) chanceType = "GOAL!";
-            else if (pointsEarnedThisMove === 5) chanceType = "full chance";
-            else if (pointsEarnedThisMove === 3) chanceType = "half chance";
-            else if (pointsEarnedThisMove === 2) chanceType = "block chance";
+                    answer.forEach((origin) => {
+                        if (targetButton.x == origin.x + 3 && targetButton.y == origin.y + 3) {
+                            origin.occupancy = "no";
+                            original = origin;
+                        }
+                    });
+                    targetAnswer.occupancy = "yes";
 
-            lastMoveData = {
-                button: compBut,
-                targetCell: compAns,
-                sourceCell: sourceCell,
-                chanceType: chanceType,
-                points: pointsEarnedThisMove,           
-                moveTeam: compBut.col,
-                nextTeam: compBut.col === 'red' ? 'blue' : 'red'
-            };
-               
-            redBefore = redPoints;
-            blueBefore = bluePoints;
-            
-            preAnim();
-            
-            setTimeout(() => {
-                playSound(kick);
-                playSound(ball);
-                n++;     
-                if (g !== 1 && (g === 2 || g === 15)) {
-                    moveManimation();
-                }
-            }, 500);
-            
-            saveMoveToHistory({
-                moveNumber: m,
-                teamColor: compBut.col,
-                factor: problemFactor,
-                button: compBut.id,
-                cellNumber: compAns.id,
-                outcome: chanceType,
-                points: pointsEarnedThisMove,
-                circles: 0
+                    let isComputer;
+                    if (matchInProgress) {
+                        if (side === 0) isComputer = (r % 2 === 0);
+                        else isComputer = (r % 2 !== 0);
+                    } else {
+                        isComputer = true;
+                    }
+
+                    calculatePoints(isComputer);
+
+                    const isRedTurn2 = (r % 2 !== 0);
+                    pointsEarnedThisMove = isRedTurn2 ? (redPoints - redBefore) : (bluePoints - blueBefore);
+
+                    let chanceType = "no chance";
+                    if (pointsEarnedThisMove === 10) chanceType = "GOAL!";
+                    else if (pointsEarnedThisMove === 5) chanceType = "full chance";
+                    else if (pointsEarnedThisMove === 3) chanceType = "half chance";
+                    else if (pointsEarnedThisMove === 2) chanceType = "block chance";
+
+                    lastMoveData = {
+                        button: compBut,
+                        targetCell: compAns,
+                        sourceCell: sourceCell,
+                        chanceType: chanceType,
+                        points: pointsEarnedThisMove,
+                        moveTeam: compBut.col,
+                        nextTeam: compBut.col === 'red' ? 'blue' : 'red'
+                    };
+
+                    redBefore = redPoints;
+                    blueBefore = bluePoints;
+
+                    preAnim();
+
+                    saveMoveToHistory({
+                        moveNumber: m,
+                        teamColor: compBut.col,
+                        factor: problemFactor,
+                        button: compBut.id,
+                        cellNumber: compAns.id,
+                        outcome: chanceType,
+                        points: pointsEarnedThisMove,
+                        circles: 0
+                    });
+
+                    z = 0;
+                    n++;
+                    if (n > 1 && n % 2 === 0) m++;
+
+                    if (g === 2 || g === 15) {
+                        moveManimation();
+                        playSound(ball);
+                        waitForAnimation(moveManimationIsRunning, () => {
+                            if (!matchInProgress) {
+                                h = 1;
+                                g = 2;
+                                handleButtonClick();
+                            }
+                        });
+                    } else {
+                        if (!matchInProgress) {
+                            h = 1;
+                            g = 2;
+                            handleButtonClick();
+                        }
+                    }
+                }, inMove(PHASE.GAP));
             });
-            
-            z = 0;
-            
-            if (!matchInProgress) {
-                h = 1;
-                g = 2;
-                handleButtonClick();
-            }
-            
-        }, 5000); // Execute after 5 seconds
+        }, inMove(PHASE.HOLD));
+    }, guessExtra);
+}, inMove(PHASE.HIGHLIGHT));
         
-        return true; // ✅ Function returns immediately!
+        return true; 
     }
     
-    // Move failed - unlock
     animationInProgress = false;
     touchEnabled = true;
     window._moveExecuted = false;
     return false;
 }
 
+
+// ============================================================
+// IDENTIFY THREAT LINKS — minimal
+//
+
+function identifyThreatLinks() {
+    if (!answer || !buttons) return { safeCells: [], threatAreas: [] };
+
+    const gameState = getGameState();
+    const { attacked, isRedTurn, ownColor, opponentColor, dir } = gameState;
+
+    const goalCell = gameState.attacked[3];
+    if (!goalCell) return { safeCells: [], threatAreas: [] };
+
+    const allDirections = ['right', 'left', 'up', 'down', 'up-left', 'down-left', 'up-right', 'down-right'];
+
+    function directionFromTo(from, to) {
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+
+        if (dx === 0 && dy === 0) return null;
+        if (dx === 0 && dy < 0) return 'up';
+        if (dx === 0 && dy > 0) return 'down';
+        if (dy === 0 && dx < 0) return 'left';
+        if (dy === 0 && dx > 0) return 'right';
+
+        if (Math.abs(dx) === Math.abs(dy)) {
+            if (dx > 0 && dy > 0) return 'down-right';
+            if (dx < 0 && dy > 0) return 'down-left';
+            if (dx > 0 && dy < 0) return 'up-right';
+            if (dx < 0 && dy < 0) return 'up-left';
+        }
+
+        return null;
+    }
+
+    // =========================================
+    // STEP 1: Find threat cells
+    //         priority first — attacked[2] and attacked[6]
+    //         then everything else
+    // =========================================
+    const threatCells = [];
+    const midY = (answer[0].y + answer[36].y) / 2;
+    const goalIsTop = (goalCell.y < midY);
+    
+    let c1 = 0, c2 = 0, c3 = 0, c4 = 0, c5 = 0, c6 = 0;
+
+    for (let cell of answer) {
+        if (cell.occupancy !== 'no') continue;
+        c1++;
+        if (cell.col !== 'white' && cell.col !== 'yellow') continue;
+        c2++;
+        if (cell === goalCell) continue;
+        c3++;
+
+        const cellIsTop = (cell.y < midY);
+        if (goalIsTop !== cellIsTop) continue;
+        c4++;
+
+        const dirToGoal = directionFromTo(cell, goalCell);
+        if (!dirToGoal) continue;
+        c5++;
+
+        const cellDir = categorizeButtonsByDirection(cell);
+        const firstBtn = cellDir && cellDir[dirToGoal] && cellDir[dirToGoal][0];
+        if (firstBtn && firstBtn.col === opponentColor) continue;
+        c6++;
+
+        // ── priority boost: if this cell is attacked[2] or attacked[6], push it to the front ──
+        const isPriority = (cell === attacked[2] || cell === attacked[6]);
+
+        if (isPriority) {
+            threatCells.unshift(cell);
+        } else {
+            threatCells.push(cell);
+        }
+    }
+    
+    
+console.log('[itl] Step 1 filter counts:', { c1, c2, c3, c4, c5, c6 });
+console.log('[itl] goalCell.id:', goalCell.id, 'goalIsTop:', goalIsTop, 'midY:', midY);
+
+    // =========================================
+    // STEP 2: creative cells linked to threat cells
+    // =========================================
+    const creativeCells = [];
+
+    for (let cell of answer) {
+        if (cell.occupancy !== 'no') continue;
+        if (cell === answer[0] || cell === answer[36]) continue;
+
+        const linksTo = [];
+
+        for (let threat of threatCells) {
+            const linkDir = directionFromTo(cell, threat);
+            if (!linkDir) continue;
+
+            const cellDir2 = categorizeButtonsByDirection(cell);
+            const firstBtnOnLine = cellDir2 && cellDir2[linkDir] && cellDir2[linkDir][0];
+
+            if (firstBtnOnLine) {
+                const dBtn    = Math.abs(firstBtnOnLine.x - (cell.x + 3)) +
+                                Math.abs(firstBtnOnLine.y - (cell.y + 3));
+                const dThreat = Math.abs(threat.x - cell.x) +
+                                Math.abs(threat.y - cell.y);
+                if (dBtn < dThreat) continue;
+            }
+
+            linksTo.push(threat.id);
+        }
+
+        if (linksTo.length > 0) {
+            creativeCells.push({
+                cellId: cell.id,
+                col: cell.col,
+                x: cell.x,
+                y: cell.y,
+                linksTo: linksTo
+            });
+        }
+    }
+
+    // =========================================
+    // STEP 3: safety filter
+    // =========================================
+    let safeCellIds = new Set();
+    let safeList = [];
+    try {
+        safeList = strictMove() || [];
+        safeCellIds = new Set(safeList.map(c => c.id));
+    } catch (e) {
+        console.warn('identifyThreatLinks: strictMove failed', e);
+    }
+
+    if (safeList.length === 0) return null;
+
+    const safeCreativeCells = creativeCells.filter(c => safeCellIds.has(c.cellId));
+
+    return {
+        safeCells: safeCreativeCells,
+        threatAreas: threatCells.map(t => ({ cellId: t.id }))
+    };
+}
+
+
+function categorizeCellsByDirection(variableLocation) {
+     const seedsByDirection = {
+    'up': [], 'down': [], 'left': [], 'right': [],
+    'up-left': [], 'up-right': [], 'down-left': [], 'down-right': []
+  };
+
+  // Step 1: find closest button in each direction
+  buttons.forEach(button => {
+    if (button !== variableLocation) {
+      const dx = button.x - variableLocation.x - 3;
+      const dy = button.y - variableLocation.y - 3;
+
+      let matchedDir = null;
+
+      if (dx === 0 && dy < 0) matchedDir = 'up';
+      else if (dx === 0 && dy > 0) matchedDir = 'down';
+      else if (dy === 0 && dx < 0) matchedDir = 'left';
+      else if (dy === 0 && dx > 0) matchedDir = 'right';
+      else if (Math.abs(dx) === Math.abs(dy)) {
+        if (dx > 0 && dy > 0) matchedDir = 'down-right';
+        else if (dx < 0 && dy > 0) matchedDir = 'down-left';
+        else if (dx > 0 && dy < 0) matchedDir = 'up-right';
+        else if (dx < 0 && dy < 0) matchedDir = 'up-left';
+      }
+
+      if (matchedDir) seedsByDirection[matchedDir].push(button);
+    }
+  });
+
+  // Step 2: sort each direction's buttons by Manhattan distance (closest first)
+  Object.keys(seedsByDirection).forEach(direction => {
+    seedsByDirection[direction].sort((a, b) => {
+      const distanceA = Math.abs(a.x - variableLocation.x) + Math.abs(a.y - variableLocation.y);
+      const distanceB = Math.abs(b.x - variableLocation.x) + Math.abs(b.y - variableLocation.y);
+      return distanceA - distanceB;
+    });
+  });
+
+  // Step 3: build the cellsBetween map
+  const cellsByDirection = {
+    'up': [], 'down': [], 'left': [], 'right': [],
+    'up-left': [], 'up-right': [], 'down-left': [], 'down-right': []
+  };
+
+  Object.keys(seedsByDirection).forEach(direction => {
+    const closestButton = seedsByDirection[direction][0];
+
+    // Gather all cells on this queen line from variableLocation,
+    // in order of increasing distance (closest first).
+    const allCellsOnLine = answer.filter(cell => {
+      const dx = cell.x - variableLocation.x;
+      const dy = cell.y - variableLocation.y;
+
+      if (dx === 0 && dy === 0) return false;
+
+      if (direction === 'up')         return (dx === 0 && dy < 0);
+      if (direction === 'down')       return (dx === 0 && dy > 0);
+      if (direction === 'left')       return (dy === 0 && dx < 0);
+      if (direction === 'right')      return (dy === 0 && dx > 0);
+      if (direction === 'up-left')    return (dx < 0 && dy < 0 && Math.abs(dx) === Math.abs(dy));
+      if (direction === 'up-right')   return (dx > 0 && dy < 0 && Math.abs(dx) === Math.abs(dy));
+      if (direction === 'down-left')  return (dx < 0 && dy > 0 && Math.abs(dx) === Math.abs(dy));
+      if (direction === 'down-right') return (dx > 0 && dy > 0 && Math.abs(dx) === Math.abs(dy));
+      return false;
+    });
+
+    allCellsOnLine.sort((a, b) => {
+      const dA = Math.abs(a.x - variableLocation.x) + Math.abs(a.y - variableLocation.y);
+      const dB = Math.abs(b.x - variableLocation.x) + Math.abs(b.y - variableLocation.y);
+      return dA - dB;
+    });
+
+    if (allCellsOnLine.length === 0) return;
+
+    // Rule 3: if nearest cell is occupied → direction is empty
+    if (allCellsOnLine[0].occupancy !== 'no') return;
+
+    // Rule 1: only unoccupied cells
+    const unoccupiedOnLine = allCellsOnLine.filter(c => c.occupancy === 'no');
+
+    if (closestButton) {
+      // Rule: bounded by the closest button — only cells before it
+      const buttonDist = Math.abs(closestButton.x - variableLocation.x - 3) +
+                         Math.abs(closestButton.y - variableLocation.y - 3);
+
+      cellsByDirection[direction] = unoccupiedOnLine.filter(cell => {
+        const cellDist = Math.abs(cell.x - variableLocation.x) +
+                         Math.abs(cell.y - variableLocation.y);
+        return cellDist < buttonDist;
+      });
+    } else {
+      // Rule 2: no button in this direction → include all unoccupied cells
+      cellsByDirection[direction] = unoccupiedOnLine;
+    }
+  });
+
+  return cellsByDirection;
+}
 
     
 function goalMove(){
@@ -12636,156 +13349,113 @@ function goalMove(){
 
                   
 function blockMove() {
-    console.log("Move check:","wingBlockMove");
-    def = 0;
-    advAns = 1;
-    let foundButton = null;
-    
-    const gameState = getGameState();
-    const { positions, opponentColor, isRedTurn } = gameState;
-    
-    // positions[0] = left white (answer[2] or answer[34])
-    // positions[1] = right white (answer[4] or answer[32])
-    // positions[4] = left yellow (answer[6] or answer[30])
-    // positions[5] = right yellow (answer[10] or answer[26])
-    const leftWhite = positions[0];
-    const rightWhite = positions[1];
-    const leftYellow = positions[4];
-    const rightYellow = positions[5];
-    
-    // Check left side: leftYellow has opponent button, leftWhite is empty
-    if (leftWhite.occupancy == 'no') {
-        const oppOnLeftYellow = buttons.find(b => 
-            b.x === leftYellow.x + 3 && b.y === leftYellow.y + 3 && b.col === opponentColor
-        );
-        
-        if (oppOnLeftYellow) {
-            compAns = leftWhite;
-            if (((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) || 
-                 (compAns.id < problemFactor && problemFactor % compAns.id == 0)) && 
-                 compAns.occupancy == "no" && 
-                 ((isRedTurn && compAns.col !== 'red') || (!isRedTurn && compAns.col !== 'blue'))) {
-                
-                foundButton = whiteMove();
-                if (foundButton) {
-                    compBut = foundButton;
-                    console.log("Choice button:", compBut.id);
-                    console.log("Choice number:", compAns.id);
-                    makeMove();
-                    return true;
-                }
-            }
-        }
-    }
-    
-    // Check right side: rightYellow has opponent button, rightWhite is empty
-    if (rightWhite.occupancy == 'no') {
-        const oppOnRightYellow = buttons.find(b => 
-            b.x === rightYellow.x + 3 && b.y === rightYellow.y + 3 && b.col === opponentColor
-        );
-        
-        if (oppOnRightYellow) {
-            compAns = rightWhite;
-            if (((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) || 
-                 (compAns.id < problemFactor && problemFactor % compAns.id == 0)) && 
-                 compAns.occupancy == "no" && 
-                 ((isRedTurn && compAns.col !== 'red') || (!isRedTurn && compAns.col !== 'blue'))) {
-                
-                foundButton = whiteMove();
-                if (foundButton) {
-                    compBut = foundButton;
-                    console.log("Choice button:", compBut.id);
-                    console.log("Choice number:", compAns.id);
-                    makeMove();
-                    return true;
-                }
-            }
-        }
-    }
-    
-    return false;
-}
-
-function midBlock() {
-    console.log("Move check:","middleBlockMove");
+    console.log("Move check:", "blockMove");
     def = 0;
     exDef = 0;
     advAns = 1;
     let foundButton = null;
-    
+
     const gameState = getGameState();
     const { positions, ownColor, opponentColor, isRedTurn } = gameState;
-    
+
     const ownGoal = positions[3];
-    
+
+    const oppositeDir = {
+        'up': 'down',
+        'down': 'up',
+        'left': 'right',
+        'right': 'left',
+        'up-left': 'down-right',
+        'up-right': 'down-left',
+        'down-left': 'up-right',
+        'down-right': 'up-left'
+    };
+
+    // categorizeCellsByDirection gives us, per direction,
+    // the unoccupied cells between ownGoal and the closest button.
+    const cellsByDir = categorizeCellsByDirection(ownGoal);
+
+    // categorizeButtonsByDirection gives us the attacker detection
     const goalDir = categorizeButtonsByDirection(ownGoal);
-    const dirKey = (ownGoal === answer[0]) ? "down" : "up";
-    const oppositeDirKey = (ownGoal === answer[0]) ? "up" : "down";
-    const firstButton = goalDir && goalDir[dirKey] && goalDir[dirKey][0];
-    
-    if (firstButton && firstButton.col === opponentColor) {
-        for (let cell of answer) {
-            // Check if cell is between goal and firstButton
-            let isBetween = false;
-            if (dirKey === "down") {
-                isBetween = cell.y + 3 < firstButton.y && cell.y > ownGoal.y;
-            } else {
-                isBetween = cell.y + 3 > firstButton.y && cell.y  < ownGoal.y;
-            }
-            
-            if (cell.occupancy === 'no' && 
-                cell.x === ownGoal.x && 
-                isBetween &&
-                categorizeButtonsByDirection(cell)[oppositeDirKey].length === 0) {
-                
-                compAns = cell;
-                if (((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) || 
-                     (compAns.id < problemFactor && problemFactor % compAns.id == 0)) && 
-                     compAns.occupancy == "no" && 
-                     ((isRedTurn && compAns.col !== 'red') || (!isRedTurn && compAns.col !== 'blue'))) {
-                    
-                    if (compAns.col != 'white' || (compAns.col == 'white' && compAns.side === opponentColor)) {
-                        foundButton = searchDirections();
-                    } else if (compAns.col == 'white' && compAns.side === ownColor) {
-                        foundButton = whiteMove();
-                    }
-                    
-                    if (foundButton) {
-                        compBut = foundButton;
-                        console.log("Choice button:", compBut.id);
-                        console.log("Choice number:", compAns.id);
-                        makeMove();
-                        return true;
-                    }
+
+    // Shuffle directions so the choice is not predictable
+    const shuffledDirs = shuffleArray(Object.keys(cellsByDir));
+
+    for (let d of shuffledDirs) {
+
+        // Opponent attacker in this direction from our goal?
+        const firstButton = goalDir && goalDir[d] && goalDir[d][0];
+        if (!firstButton || firstButton.col !== opponentColor) continue;
+
+        // Cells between ownGoal and that attacker, same line, unoccupied
+        const candidates = cellsByDir[d];
+
+        for (let cell of candidates) {
+
+            // Opposite direction from cell must be clear
+            const cellDir = categorizeButtonsByDirection(cell);
+            if (cellDir[oppositeDir[d]] && cellDir[oppositeDir[d]].length > 0) continue;
+
+            compAns = cell;
+            if (
+                ((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) ||
+                 (compAns.id < problemFactor && problemFactor % compAns.id == 0)) &&
+                compAns.occupancy == "no" &&
+                ((isRedTurn && compAns.col !== 'red') || (!isRedTurn && compAns.col !== 'blue'))
+            ) {
+                if (compAns.col != 'white' || (compAns.col == 'white' && compAns.side === opponentColor)) {
+                    foundButton = searchDirections();
+                } else if (compAns.col == 'white' && compAns.side === ownColor) {
+                    foundButton = whiteMove();
+                }
+
+                if (foundButton) {
+                    compBut = foundButton;
+                    console.log("Choice button:", compBut.id);
+                    console.log("Choice number:", compAns.id);
+                    makeMove();
+                    return true;
                 }
             }
         }
     }
-    
+
     return false;
 }
       
 // In fullChance()
 function fullChance() {
-    console.log("Move check:","fullChance");
+    console.log("Move check:", "fullChance");
     def = 1;
     exDef = 0;
     advAns = 0;
     let foundButton = null;
-    
+
     const gameState = getGameState();
-    const { attacked, isRedTurn } = gameState;
-    
-    // attacked[0], attacked[1], attacked[2] = opponent's white squares
-    const opponentWhiteSquares = [attacked[0], attacked[1], attacked[2]];
-    
-    for (let whitePos of opponentWhiteSquares) {
-        compAns = whitePos;
-        if (((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) || 
-             (compAns.id < problemFactor && problemFactor % compAns.id == 0)) && 
-             compAns.occupancy == "no" && 
-             ((isRedTurn && compAns.col !== 'red') || (!isRedTurn && compAns.col !== 'blue'))) {
-            
+    const { attacked, isRedTurn, dir } = gameState;
+
+    // Reference y: first cell closest to the goal we're attacking
+    const referenceY = (dir === "up")
+        ? attacked[3].y + increY
+        : attacked[3].y - increY;
+
+    // Full-chance candidates: every white cell at the reference y
+    const fullChanceCells = answer.filter(cell =>
+        cell.col === 'white' &&
+        cell.y === referenceY
+    );
+
+    // Shuffle so the choice is not predictable
+    const shuffled = shuffleArray(fullChanceCells);
+
+    for (let cell of shuffled) {
+        compAns = cell;
+        if (
+            ((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) ||
+             (compAns.id < problemFactor && problemFactor % compAns.id == 0)) &&
+            compAns.occupancy == "no" &&
+            ((isRedTurn && compAns.col !== 'red') || (!isRedTurn && compAns.col !== 'blue'))
+        ) {
             foundButton = searchDirections();
             if (foundButton) {
                 compBut = foundButton;
@@ -12796,126 +13466,83 @@ function fullChance() {
             }
         }
     }
-    
+
     return false;
 }
 
 function halfChance() {
-    console.log("Move check:","wingHalfChance");
+    console.log("Move check:", "halfChance");
     def = 1;
     exDef = 0;
     advAns = 0;
     let foundButton = null;
-    
-    const gameState = getGameState();
-    const { attacked, isRedTurn } = gameState;
-    
-    // attacked[0] = left white, attacked[1] = right white
-    // attacked[4] = left yellow, attacked[5] = right yellow
-    const leftWhite = attacked[0];
-    const rightWhite = attacked[1];
-    const leftYellow = attacked[4];
-    const rightYellow = attacked[5];
-    
-    // Check left side: leftWhite empty AND leftYellow empty
-    if (leftWhite.occupancy == 'no' && leftYellow.occupancy == 'no') {
-        compAns = leftYellow;
-        if (((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) || 
-             (compAns.id < problemFactor && problemFactor % compAns.id == 0)) && 
-             compAns.occupancy == "no" && 
-             ((isRedTurn && compAns.col !== 'red') || (!isRedTurn && compAns.col !== 'blue'))) {
-            
-            foundButton = searchDirections();
-            if (foundButton) {
-                compBut = foundButton;
-                console.log("Choice button:", compBut.id);
-                console.log("Choice number:", compAns.id);
-                makeMove();
-                return true;
-            }
-        }
-    }
-    
-    // Check right side: rightWhite empty AND rightYellow empty
-    if (rightWhite.occupancy == 'no' && rightYellow.occupancy == 'no') {
-        compAns = rightYellow;
-        if (((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) || 
-             (compAns.id < problemFactor && problemFactor % compAns.id == 0)) && 
-             compAns.occupancy == "no" && 
-             ((isRedTurn && compAns.col !== 'red') || (!isRedTurn && compAns.col !== 'blue'))) {
-            
-            foundButton = searchDirections();
-            if (foundButton) {
-                compBut = foundButton;
-                console.log("Choice button:", compBut.id);
-                console.log("Choice number:", compAns.id);
-                makeMove();
-                return true;
-            }
-        }
-    }
-    
-    return false;
-}
 
-
-function midChance() {
-    console.log("Move check:","middleHalfChance");
-    def = 0;
-    exDef = 0;
-    advAns = 0;
-    let foundButton = null;
-    
     const gameState = getGameState();
-    const { attacked, ownColor, opponentColor, isRedTurn, dir } = gameState;
-    
-    // attacked[3] = opponent's goal (what we're attacking)
-    const opponentGoal = attacked[3];
-    
-    // Direction from cell toward the opponent's goal
-    const goalDirKey = (opponentGoal === answer[36]) ? "down" : "up";
-    
+    const { attacked, isRedTurn, dir } = gameState;
+
+    // Reference y: one step in front of the goal we're attacking
+    const referenceY = (dir === "up")
+        ? attacked[3].y + increY
+        : attacked[3].y - increY;
+
+    const goalCell = attacked[3];
+    const allDirections = ['right', 'left', 'up', 'down', 'up-left', 'down-left', 'up-right', 'down-right'];
+
+    const chanceCells = [];
+
+    // 1. Iterate answer
     for (let cell of answer) {
-        // Check if cell is in the same column as the goal
-        // AND cell is between the goal and the edge (no button in that direction)
-        let isBetween = false;
-        if (goalDirKey === "down") {
-            // Goal is at bottom, cells should be ABOVE the goal
-            isBetween = cell.y < opponentGoal.y;
-        } else {
-            // goalDirKey === "up", goal is at top, cells should be BELOW the goal
-            isBetween = cell.y > opponentGoal.y;
+
+        // 2. Only white or yellow cells
+        if (cell.col !== 'white' && cell.col !== 'yellow') continue;
+
+        // Candidate must be beyond the reference row — half chance zone
+        if (dir === "up" && !(cell.y > referenceY)) continue;
+        if (dir === "down" && !(cell.y < referenceY)) continue;
+
+        // 3. Reachable cells from the candidate, per direction
+        const cellsByDir = categorizeCellsByDirection(cell);
+
+        // 4. Find the direction where the goal appears in the candidate's reachable cells
+        let matchedDir = null;
+        for (let d of allDirections) {
+            const arr = cellsByDir[d];
+            if (!arr) continue;
+            if (arr.includes(goalCell)) {
+                matchedDir = d;
+                break;
+            }
         }
-        
-        if (cell.occupancy == 'no' && 
-            cell.x === opponentGoal.x && 
-            isBetween &&
-            categorizeButtonsByDirection(cell)[goalDirKey].length === 0 &&
-            cell.id !== opponentGoal.id) {
-            
-            compAns = cell;
-            if (((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) || 
-                 (compAns.id < problemFactor && problemFactor % compAns.id == 0)) && 
-                 compAns.occupancy == "no" && 
-                 ((isRedTurn && compAns.col !== 'red') || (!isRedTurn && compAns.col !== 'blue'))) {
-                
-                if (compAns.col != 'white' || (compAns.col == 'white' && compAns.side === opponentColor)) {
-                        foundButton = searchDirections();
-                    } else if (compAns.col == 'white' && compAns.side === ownColor) {
-                        foundButton = whiteMove();
-                    }
-                
-                if (foundButton) {
-                    compBut = foundButton;
-                    console.log("Choice button:", compBut.id);
-                    console.log("Choice number:", compAns.id);
-                    makeMove();
-                    return true;
-                }
+        if (!matchedDir) continue;
+
+        // 5. Confirm no button along that direction from the candidate
+        const cellDir = categorizeButtonsByDirection(cell);
+        if (cellDir[matchedDir] && cellDir[matchedDir].length > 0) continue;
+
+        chanceCells.push(cell);
+    }
+
+    const shuffled = shuffleArray(chanceCells);
+
+    for (let cell of shuffled) {
+        compAns = cell;
+        if (
+            ((compAns.id >= problemFactor && compAns.id / problemFactor < 10 && compAns.id % problemFactor == 0) ||
+             (compAns.id < problemFactor && problemFactor % compAns.id == 0)) &&
+            compAns.occupancy == "no" &&
+            ((isRedTurn && compAns.col !== 'red') || (!isRedTurn && compAns.col !== 'blue'))
+        ) {
+            foundButton = searchDirections();
+            if (foundButton) {
+                compBut = foundButton;
+                console.log("Choice button:", compBut.id);
+                console.log("Choice number:", compAns.id);
+                makeMove();
+                return true;
             }
         }
     }
-    
+
     return false;
 }
 
@@ -12977,157 +13604,149 @@ advAns=0;
 }
 
 function creativeMove() {
-    console.log("Move check:", "creativeMove");
+    console.log("Move check:", "creativeMoveplus");
     def = 1;
     exDef = 1;
     advAns = 0;
-    let eligAttMid = strictMove();
 
-    let targetAnswers = [];
-    
-    // Upper creative positions (when attacking top)
-    const upperPositions = [answer[7], answer[9], answer[12], answer[14], answer[16], answer[18], answer[20]];
-    // Lower creative positions (when attacking bottom) - descending order
-    const lowerPositions = [answer[29], answer[27], answer[24], answer[22], answer[20], answer[18], answer[16]];
+    const gameState = getGameState();
+    const { ownColor, opponentColor } = gameState;
 
-    // Determine which player is attacking creatively based on side and turn
-    if (side === 0) {
-        if (r % 2 !== 0) {
-            // Red's turn - attacking bottom
-            targetAnswers = lowerPositions;
-        } else {
-            // Blue's turn - attacking top
-            targetAnswers = upperPositions;
+    let safeList = [];
+    try {
+        safeList = strictMove() || [];
+    } catch (e) {
+        console.warn('identifyThreatLinks: strictMove failed', e);
+    }
+
+    console.log('creative: safeList.length =', safeList.length);
+    if (safeList.length === 0) return null;
+
+    let result;
+    try {
+        result = identifyThreatLinks();
+    } catch (e) {
+        console.log("creativeMoveplus: identifier failed", e);
+        return false;
+    }
+
+    console.log('creative: identifyThreatLinks returned', result);
+
+    if (result === null) {
+        console.log('creative: result is null');
+        return false;
+    }
+
+    const safeCells = (result && result.safeCells) ? result.safeCells : [];
+    console.log('creative: safeCells.length =', safeCells.length);
+    if (safeCells.length === 0) return false;
+
+    const ranked = safeCells
+        .filter(c => c.linksTo && c.linksTo.length > 0)
+        .sort((a, b) => b.linksTo.length - a.linksTo.length);
+
+    console.log('creative: ranked.length =', ranked.length);
+
+    for (const candidate of ranked) {
+        const target = answer.find(c => c.id === candidate.cellId);
+        if (!target) continue;
+
+        compAns = target;
+
+        let foundButton = null;
+        if (compAns.col != 'white' ||
+            (compAns.col == 'white' && compAns.side === opponentColor)) {
+            foundButton = searchDirections();
+        } else if (compAns.col == 'white' && compAns.side === ownColor) {
+            foundButton = whiteMove();
         }
-    } else {
-        if (r % 2 !== 0) {
-            // Red's turn - attacking top
-            targetAnswers = upperPositions;
-        } else {
-            // Blue's turn - attacking bottom
-            targetAnswers = lowerPositions;
+
+        if (foundButton) {
+            compBut = foundButton;
+            console.log("Choice button:", compBut.id);
+            console.log("Choice number:", compAns.id);
+            console.log("Links to threats:", candidate.linksTo.join(", "));
+            makeMove();
+            return true;
         }
     }
 
-    if (!eligAttMid || eligAttMid.length === 0) return false;
-    
-    const shuffled = shuffleArray([...eligAttMid]);   
-    for (let candidate of shuffled) {
-        if (targetAnswers.includes(candidate)) {
-            compAns = candidate;
-            let foundButton = null;
-            if (compAns) {
-                foundButton = searchDirections();
-                if (foundButton) {
-                    compBut = foundButton;
-                    console.log("Choice button:", compBut.id);
-                    console.log("Choice number:", compAns.id);
-                    makeMove();
-                    return true;
-                }
-            }
-        }
-    }
+    console.log('[cmp] exit: no foundButton across all candidates');
     return false;
-}
+    }
 
 function creativeMoveplus() {
     console.log("Move check:", "creativeMoveplus");
     def = 1;
     exDef = 1;
     advAns = 1;
-    let eligAttMid = strictMove();
 
-    let targetAnswers = [];
-    
-    // Upper creative positions (when attacking top)
-    const upperPositions = [answer[7], answer[9], answer[12], answer[14], answer[16], answer[18], answer[20]];
-    // Lower creative positions (when attacking bottom) - descending order
-    const lowerPositions = [answer[29], answer[27], answer[24], answer[22], answer[20], answer[18], answer[16]];
+    const gameState = getGameState();
+    const { ownColor, opponentColor } = gameState;
 
-    // Determine which player is attacking creatively based on side and turn
-    if (side === 0) {
-        if (r % 2 !== 0) {
-            // Red's turn - attacking bottom
-            targetAnswers = upperPositions;
-        } else {
-            // Blue's turn - attacking top
-            targetAnswers = lowerPositions;
+    let safeList = [];
+    try {
+        safeList = strictMove() || [];
+    } catch (e) {
+        console.warn('identifyThreatLinks: strictMove failed', e);
+    }
+
+    console.log('[cmp] safeList.length:', safeList.length);
+    if (safeList.length === 0) return null;
+
+    let result;
+    try {
+        result = identifyThreatLinks();
+    } catch (e) {
+        console.log("creativeMoveplus: identifier failed", e);
+        return false;
+    }
+
+    console.log('[cmp] identifyThreatLinks returned:', result);
+
+    if (result === null) {
+        console.log('[cmp] exit: result null');
+        return false;
+    }
+
+    const safeCells = (result && result.safeCells) ? result.safeCells : [];
+    console.log('[cmp] safeCells.length:', safeCells.length);
+    if (safeCells.length === 0) {
+        console.log('[cmp] exit: no safe cells');
+        return false;
+    }
+
+    const ranked = safeCells
+        .filter(c => c.linksTo && c.linksTo.length > 0)
+        .sort((a, b) => b.linksTo.length - a.linksTo.length);
+
+    console.log('[cmp] ranked.length:', ranked.length);
+
+    for (const candidate of ranked) {
+        const target = answer.find(c => c.id === candidate.cellId);
+        if (!target) continue;
+
+        compAns = target;
+
+        let foundButton = null;
+        if (compAns.col != 'white' ||
+            (compAns.col == 'white' && compAns.side === opponentColor)) {
+            foundButton = searchDirections();
+        } else if (compAns.col == 'white' && compAns.side === ownColor) {
+            foundButton = whiteMove();
         }
-    } else {
-        if (r % 2 !== 0) {
-            // Red's turn - attacking top
-            targetAnswers = lowerPositions;
-        } else {
-            // Blue's turn - attacking bottom
-            targetAnswers = upperPositions;
+
+        if (foundButton) {
+            compBut = foundButton;
+            console.log("Choice button:", compBut.id);
+            console.log("Choice number:", compAns.id);
+            console.log("Links to threats:", candidate.linksTo.join(", "));
+            makeMove();
+            return true;
         }
     }
 
-    if (!eligAttMid || eligAttMid.length === 0) return false;
-    
-    const shuffled = shuffleArray([...eligAttMid]);
-    for (let candidate of shuffled) {
-        if (targetAnswers.includes(candidate)) {
-            compAns = candidate;
-            let foundButton = null;
-            if (compAns) {
-                foundButton = searchDirections();
-                if (foundButton) {
-                    compBut = foundButton;
-                    console.log("Choice button:", compBut.id);
-                    console.log("Choice number:", compAns.id);
-                    makeMove();
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-
-function safeUp(){
-console.log("Move check:","safe upward");
-def=1;
-advAns=0;
-// let foundButton = null;
-let eligSafeProg = strictMove();   
-
-  if (!eligSafeProg || eligSafeProg.length === 0) return false;
-    
-    // Shuffle candidates for variety
-    const shuffled = shuffleArray([...eligSafeProg]);
-  for (let candidate of shuffled) {
-
-    // Branch 1 — original, AI simulating Blue's up-move (side===0)
-    if (side==0 && r%2==0 && (candidate.col!='white' || (candidate.col=='white' && candidate.side=='red'))) {
-        compAns = candidate;
-        const foundButton = up();
-        if (foundButton) { compBut = foundButton; makeMove(); return true; }
-    }
-
-    // Branch 2 — original, AI simulating Red's up-move (side===1)
-    if (side==1 && r%2!=0 && (candidate.col!='white' || (candidate.col=='white' && candidate.side=='blue'))) {
-        compAns = candidate;
-        const foundButton = up();
-        if (foundButton) { compBut = foundButton; makeMove(); return true; }
-    }
-
-    // Branch 3 — the OTHER direction for side===0
-    if (side==0 && r%2!=0 && (candidate.col!='white' || (candidate.col=='white' && candidate.side=='blue'))) {
-        compAns = candidate;
-        const foundButton = down();
-        if (foundButton) { compBut = foundButton; makeMove(); return true; }
-    }
-
-    // Branch 4 — the OTHER direction for side===1
-    if (side==1 && r%2==0 && (candidate.col!='white' || (candidate.col=='white' && candidate.side=='red'))) {
-        compAns = candidate;
-        const foundButton = down();
-        if (foundButton) { compBut = foundButton; makeMove(); return true; }
-    }
-}
+    console.log('[cmp] exit: no foundButton across all candidates');
     return false;
 }
 
@@ -13198,73 +13817,6 @@ function anysafeMoveplus() {
     return false;
 }
 
-function safeDown() {
-    console.log("Move check:", "safe downward");
-    def = 0;
-    advAns = 0;
-
-    let eligSafeProg = strictMove();
-    if (!eligSafeProg || eligSafeProg.length === 0) return false;
-
-    const shuffled = shuffleArray([...eligSafeProg]);
-
-    for (let candidate of shuffled) {
-
-        // Branch 1 — side===0, Blue's turn → Blue attacks down
-        if ((side==0 && r%2==0 && (candidate.col!='white' || (candidate.col=='white' && candidate.side=='red')))) {
-            compAns = candidate;
-            const foundButton = down();
-            if (foundButton) {
-                compBut = foundButton;
-                console.log("Choice button:", compBut.id);
-                console.log("Choice number:", compAns.id);
-                makeMove();
-                return true;
-            }
-        }
-
-        // Branch 2 — side===0, Red's turn → Red attacks down
-        if ((side==0 && r%2!=0 && (candidate.col!='white' || (candidate.col=='white' && candidate.side=='blue')))) {
-            compAns = candidate;
-            const foundButton = down();
-            if (foundButton) {
-                compBut = foundButton;
-                console.log("Choice button:", compBut.id);
-                console.log("Choice number:", compAns.id);
-                makeMove();
-                return true;
-            }
-        }
-
-        // Branch 3 — side===1, Red's turn → Red attacks down
-        if ((side==1 && r%2!=0 && (candidate.col!='white' || (candidate.col=='white' && candidate.side=='blue')))) {
-            compAns = candidate;
-            const foundButton = down();
-            if (foundButton) {
-                compBut = foundButton;
-                console.log("Choice button:", compBut.id);
-                console.log("Choice number:", compAns.id);
-                makeMove();
-                return true;
-            }
-        }
-
-        // Branch 4 — side===1, Blue's turn → Blue attacks down
-        if ((side==1 && r%2==0 && (candidate.col!='white' || (candidate.col=='white' && candidate.side=='red')))) {
-            compAns = candidate;
-            const foundButton = down();
-            if (foundButton) {
-                compBut = foundButton;
-                console.log("Choice button:", compBut.id);
-                console.log("Choice number:", compAns.id);
-                makeMove();
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
 
 function anyWhichMove() {
     console.log("Move check:","safe numbers with unsafe buttons");
@@ -13376,8 +13928,14 @@ function anyHowMove() {
 
 let lastTime = 0;
 let animationFrameId;
+// ===========================================
+// MOVE ANIMATION — sprite-baked, delta-time, low-tier safe
+// ===========================================
+function moveManimationIsRunning() {
+    return typeof animationFrameId !== 'undefined' && animationFrameId !== null;
+}
+
 function moveManimation() {
-    // ✅ Allow HvA (g=2), AvA (g=15), and AI match (g=0 for compatibility)
     if (g !== 2 && g !== 15) {
         cancelAnimationFrame(calcAnimationFrameId);
         calcAnimationFrameId = null;
@@ -13386,50 +13944,128 @@ function moveManimation() {
         touchEnabled = true;
         return;
     }
-    
+
     animationInProgress = true;
-    const targetX = targetAnswer.x + 3;
-    const targetY = targetAnswer.y + 3;
-    const speed = 100;
     touchEnabled = false;
 
-    function animate(timestamp) {
-        const deltaTime = timestamp - lastTime;
-        lastTime = timestamp;
+    const targetX = targetAnswer.x + 3;
+    const targetY = targetAnswer.y + 3;
+    const speed   = 200 * gameSpeedMultiplier;
 
-        ctx.clearRect(0, 0, cW, cH);
-        renderAnswer();
-        renderStats();
-        
-        // ✅ Only show statDraw for HvA (g=2), not for AI vs AI (g=0)
-        if (g === 2 && !matchInProgress) {
+    // =============================================
+    // 1. Bake static scene (offscreen, identity transform)
+    // =============================================
+    const baseCanvas = document.createElement('canvas');
+    baseCanvas.width  = 360;
+    baseCanvas.height = 800;
+    const baseCtx = baseCanvas.getContext('2d');
+
+    const savedCtx = ctx;
+    ctx = baseCtx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, 360, 800);
+    renderAnswer();
+    renderStats();
     statDraw(va, vb, vc, vd, ve, vf, vg, vh);
-}
+    manRenderButtons();
+    ctx = savedCtx;
+
+    // =============================================
+    // 2. Bake the moving-button sprite
+    //    Save/restore targetButton state around the bake
+    // =============================================
+    const savedTagBox = targetButton.tagBox;
+    const savedBtnX   = targetButton.x;
+    const savedBtnY   = targetButton.y;
+
+    const btnSprite = document.createElement('canvas');
+    btnSprite.width  = 45;
+    btnSprite.height = 45;
+    const bsCtx = btnSprite.getContext('2d');
+
+    const savedCtx2 = ctx;
+    ctx = bsCtx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, 45, 45);
+    manButtonMove(0, 0);
+    ctx = savedCtx2;
+
+    targetButton.tagBox = savedTagBox;
+    targetButton.x      = savedBtnX;
+    targetButton.y      = savedBtnY;
+
+    // =============================================
+    // 3. Offscreen frame buffer
+    // =============================================
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width  = 360;
+    offCanvas.height = 800;
+    const offCtx = offCanvas.getContext('2d');
+
+    let lastFrameTime = 0;
+    let lastMoveTime  = 0;
+
+    function animate(timestamp) {
+        if (gamePaused) {
+            animationFrameId = requestAnimationFrame(animate);
+            return;
+        }
+
+        if (!lastMoveTime) lastMoveTime = timestamp;
+        if (timestamp - lastFrameTime < FRAME_MS) {
+            animationFrameId = requestAnimationFrame(animate);
+            return;
+        }
+
+        const deltaTime = Math.min(timestamp - lastMoveTime, 60);
+        lastMoveTime    = timestamp;
+        lastFrameTime   = timestamp;
 
         const dx = targetX - targetButton.x;
         const dy = targetY - targetButton.y;
 
+        // ---------- Arrived ----------
         if (Math.abs(dx) < 1 && Math.abs(dy) < 1) {
             targetButton.x = targetX;
             targetButton.y = targetY;
-            manRenderButtons();        
-            manButtonMove(targetButton.x, targetButton.y);
-            animationInProgress = false;
-            touchEnabled = true;
-            cancelAnimationFrame(animationFrameId);      
-            postAnim();  // ✅ postAnim() now called for both modes
-        } else {
-            const moveX = Math.sign(dx) * Math.min(speed * (deltaTime / 1000), Math.abs(dx));
-            const moveY = Math.sign(dy) * Math.min(speed * (deltaTime / 1000), Math.abs(dy));
 
-            targetButton.x += moveX;
-            targetButton.y += moveY;
-            manRenderButtons();
-            manButtonMove(targetButton.x, targetButton.y);
-            animationFrameId = requestAnimationFrame(animate);
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+
+            resetMainTransform();
+            ctx.clearRect(0, 0, 360, 800);
+            renderAnswer();
+            renderButtons();
+            renderStats();
+            statDraw(va, vb, vc, vd, ve, vf, vg, vh);
+            postAnim();
+            return;
         }
+
+        const moveX = Math.sign(dx) * Math.min(speed * (deltaTime / 1000), Math.abs(dx));
+        const moveY = Math.sign(dy) * Math.min(speed * (deltaTime / 1000), Math.abs(dy));
+
+        targetButton.x += moveX;
+        targetButton.y += moveY;
+
+        // ---------- Compose ----------
+        const saveInner = ctx;
+        ctx = offCtx;
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, 360, 800);
+        ctx.drawImage(baseCanvas, 0, 0, 360, 800);
+        ctx.drawImage(btnSprite, targetButton.x, targetButton.y);
+        ctx = saveInner;
+
+        // ---------- Blit to main canvas ----------
+        resetMainTransform();
+        ctx.clearRect(0, 0, 360, 800);
+        ctx.drawImage(offCanvas, 0, 0, 360, 800);
+
+        animationFrameId = requestAnimationFrame(animate);
     }
-    lastTime = performance.now();
+
+    lastMoveTime = performance.now();
     animationFrameId = requestAnimationFrame(animate);
 }
 
@@ -13763,21 +14399,15 @@ function generateMove1DisplayData() {
     const currentTeam = isRedTurn ? 'red' : 'blue';
     const turnNumber = m;
     
-    // Set global display variables - NO statDraw here!
-    va = "All Mathsoccer calculations are automatic. "; 
-    vb = `Find your move options here. It's ${capitalizeFirst(currentTeam)} turn ${turnNumber}.`;
-     
-    // Get valid links
-    if (typeof valAns === 'function') valAns();
-    const nextLinks = generateLinksForTeam(currentTeam);
-    const formatLink = (id, arr) => arr.length > 0 ? `${id}(${arr.join(',')})` : `${id}(no link)`;
-    
-    vc = `Valid ${capitalizeFirst(currentTeam)} links:`;
-    vd = formatLink('W', nextLinks.W);
-    ve = formatLink('X', nextLinks.X);
-    vf = formatLink('Y', nextLinks.Y);
-    vg = formatLink('Z', nextLinks.Z);
-    vh = currentTeam;
+// Set global display variables - NO statDraw here!
+    vb = "is a balance simulation system ";
+    vc = "used to prevent access to circled home ";
+    vd = "territories and number 1 seat, while ";
+    ve = "aiming for the top number 1 seat, ";
+    va = "MATHSOCCER";
+    vf = "based on Princewill's ";
+    vg = "law of imbalance.";
+    vh = 'white';
     speakText("Always read the Mathsoccer textbox for your best move options.");
   const difficultyNames = ['genius', 'advanced', 'intermediate', 'beginner'];
 const currentDifficulty = difficultyNames[l] || 'genius';
@@ -13878,10 +14508,18 @@ function findLinkedNumbersForButton(button) {
     
     // Check each number in curAns
     curAns.forEach(number => {
-        const targetCell = answer.find(cell => cell.id == number);
-        if (!targetCell) return;
-        
-        // WHITE SECTION RULE: Only my white button can enter my white if occupied
+    const opponentColor = (currentTeam === 'red') ? 'blue' : 'red';
+
+    let targetCell;
+    if (number == 1) {
+        targetCell = answer.find(c => c.id == 1 && c.col === opponentColor);
+    } else {
+        targetCell = answer.find(c => c.id == number);
+    }
+
+    if (!targetCell) return;
+
+          // WHITE SECTION RULE: Only my white button can enter my white if occupied
         if (targetCell.col === 'white' && targetCell.side === currentTeam) {
             if (hasWhiteButton && !isThisWhiteButton) {
                 return; // Cannot enter occupied white
@@ -13936,10 +14574,17 @@ function highlightButtonAndNumbers(button, numbers) {
   ctx.arc(button.x + 22.5, button.y + 22.5, 23, 0, 2 * Math.PI);
         ctx.stroke();
   
-    // FRAME linked numbers in player's color - only opponent's cells
-    numbers.forEach(number => {
-        const cell = answer.find(c => c.id == number);
-        if (cell && (r % 2 !== 0 && cell.col !== 'red' || r % 2 === 0 && cell.col !== 'blue')) {
+    // FRAME linked numbers in player's color
+    const opponentColor = (currentTeam === 'red') ? 'blue' : 'red';
+
+numbers.forEach(number => {
+    let cell;
+    if (number == 1) {
+        cell = answer.find(c => c.id == 1 && c.col === opponentColor);
+    } else {
+        cell = answer.find(c => c.id == number);
+    }
+
             ctx.strokeStyle = currentTeam;
             ctx.lineWidth = 4;
             ctx.strokeRect(cell.x + 2, cell.y + 2, cell.w - 4, cell.h - 4);
@@ -13952,7 +14597,7 @@ function highlightButtonAndNumbers(button, numbers) {
             ctx.textBaseline = 'middle';
             ctx.fillText(cell.id, cell.x + 25, cell.y + 27);
             
-        }
+        
     });
 }
 
@@ -13963,11 +14608,19 @@ function highlightButtonAndNumbers(button, numbers) {
 function showStartButtons() {
     drawLandingButton3D('Play Red', 125, 712, 'red', 'white');
     drawLandingButton3D('Play Blue', 207, 712, 'blue', 'white');    
+
+    // ✅ Explicit save/restore + explicit alignment
+    ctx.save();
+    ctx.textAlign = 'center';          // ← force center
+    ctx.textBaseline = 'middle';       // ← force middle
     ctx.fillStyle = '#CFC';
     ctx.font = 'bold 12px fantasy, papyrus';
+
     ctx.fillText("AI match ends after 28 moves.", 180, 685);
     ctx.fillText("How to play: Touch a token and a framed number.", 180, 775);
     ctx.fillText("Find a way to get to the top number 1.", 180, 790);
+
+    ctx.restore();                     // ← restores state cleanly
 }
 
 
@@ -14015,12 +14668,13 @@ requestWakeLock();
     renderAnswer();
     renderButtons();
     renderStats();   
+    generateMove1DisplayData();
     redBefore = redPoints;
     blueBefore = bluePoints;
     playSound(welcome);        
        
     if (autoMoveTimer) clearTimeout(autoMoveTimer);
-    autoMoveTimer = setTimeout(autoMove, 12000);
+    autoMoveTimer = setTimeout(autoMove, Math.max(500, 7000 / gameSpeedMultiplier));
     
     // ✅ Intro speech for AvA match
    
@@ -14086,7 +14740,7 @@ if (redGoal > blueGoal) {
             
             if (matchInProgress && !gameOverActive && n < 28) {
                 if (autoMoveTimer) clearTimeout(autoMoveTimer);
-                autoMoveTimer = setTimeout(autoMove, 18000);
+                autoMoveTimer = setTimeout(autoMove, Math.max(500, 15000 / gameSpeedMultiplier));     
             }      
     } 
     else if (matchInProgress && !gameOverActive && n < 28) {
@@ -14096,7 +14750,7 @@ if (redGoal > blueGoal) {
         renderStats();               
         
             if (autoMoveTimer) clearTimeout(autoMoveTimer);
-            autoMoveTimer = setTimeout(autoMove, 12000);       
+            autoMoveTimer = setTimeout(autoMove, Math.max(500, 9000 / gameSpeedMultiplier));         
     }
     else if(n===28){    
     setTimeout(function(){   
@@ -14151,7 +14805,7 @@ l = isRedTurn ? redDifficulty : blueDifficulty;
     window._moveExecuted = false;
     
     // First turn
-    if (n === 0) {
+    if (n === 1) {
         startMove();
         afterAutoMove();
         return;
@@ -14160,21 +14814,17 @@ l = isRedTurn ? redDifficulty : blueDifficulty;
     // Priority chain
     if (goalMove()) { afterAutoMove(); return; }
     if (blockMove()) { afterAutoMove(); return; }
-    if (midBlock()) { afterAutoMove(); return; }
     if (fullChance()) { afterAutoMove(); return; }
     if (halfChance()) { afterAutoMove(); return; }
-    if (midChance()) { afterAutoMove(); return; }
-    
+  
     if (l < 1) {
         if (creativeMoveplus()) { afterAutoMove(); return; }
         if (creativeMove()) { afterAutoMove(); return; }
-        if (safeUp()) { afterAutoMove(); return; }  
-    }
+           }
   
     if (l < 2) {        
         if (anysafeMoveplus()) { afterAutoMove(); return; }
-        if (safeDown()) { afterAutoMove(); return; }  
-    }
+            }
     
     if (l < 3) {
         if (anysafeMove()) { afterAutoMove(); return; }     
@@ -14205,6 +14855,13 @@ calculationAnimationEnabled=true;
 
 // Add this new function
 function resetForNewGame() {
+guessMode = 'watch';
+awaitingGuess = false;
+pendingGuessCell = null;
+delayPickerVisible = false;
+correctGuesses = 0;
+totalGuesses = 0;
+guessHighlightCell = null;
     // Cancel animations and timers
     if (timerCom) clearTimeout(timerCom);
     if (animationFrameId) cancelAnimationFrame(animationFrameId);
@@ -14317,24 +14974,25 @@ function showLandingPage() {
     // BOARD 1 - TOP
 draw3DBoard(ctx, 30, 192, 300, 70, 4, '#2E8B57', '#1e4d33', '#CFC', '#A8D5A8');
 ctx.fillStyle='black'; ctx.font='bold 14px fantasy, papyrus'; ctx.textAlign='center'; ctx.textBaseline='middle';
-ctx.fillText("The world's only factor handoff system ", 180, 206);
-ctx.fillText("combining chess, maths and football.", 180, 226);
-ctx.fillText("AI does the math. You score the goals.", 180, 246);
+ctx.fillText("The world's first balance simulation ", 180, 206);
+ctx.fillText("system based on the law of imbalance.", 180, 226);
+ctx.fillText("AI does the math. You do the balance.", 180, 246);
 
 // BOARD 2 - MIDDLE
 draw3DBoard(ctx, 30, 337, 300, 70, 4, '#2E8B57', '#1e4d33', '#CFC', '#A8D5A8');
 ctx.fillStyle='black'; ctx.font='bold 14px fantasy, papyrus'; ctx.textAlign='center'; ctx.textBaseline='middle';
-ctx.fillText("Score goals on a chess board using ", 180, 351);
-ctx.fillText("multiplication, division, inequalities and", 180, 371);
-ctx.fillText("factors - the four pillars of mathematics. ", 180, 391);
+ctx.fillText("Emerging factors create new imbalances. ", 180, 351);
+ctx.fillText("Use them to prevent token access to your ", 180, 371);
+ctx.fillText("territory while aiming for number 1. ", 180, 391);
 
 // BOARD 3 - BOTTOM
 draw3DBoard(ctx, 30, 481, 300, 70, 4, '#2E8B57', '#1e4d33', '#CFC', '#A8D5A8');
 ctx.fillStyle='black'; ctx.font='bold 14px fantasy, papyrus'; ctx.textAlign='center'; ctx.textBaseline='middle';
+
 ctx.fillText("How to play: Touch a token and", 180, 495);
 ctx.fillText("a number framed in your color.", 180, 515);
 ctx.fillText("Find a way to get to the top number 1.", 180, 535);
-    
+
     ctx.fillStyle = '#CFC';
     ctx.font = 'bold 12px fantasy, papyrus';
     ctx.fillText("Choose a side to play: red or blue.", 180, 775);
@@ -14499,8 +15157,31 @@ function draw3DBoard(ctx, x, y, w, h, depth, topColor, sideColor, innerTopColor,
   
        //identifying clicked coordinates for picking
 function handleButtonClick(touchX, touchY) {
-console.log('Touch:', touchX, touchY); // Debug
+/*
+    // ---- PAUSE / PLAY ----
+    if (window._pauseBtnBox) {
+        const b = window._pauseBtnBox;
+        if (touchX >= b.x && touchX <= b.x + b.w &&
+            touchY >= b.y && touchY <= b.y + b.h) {
+            togglePause();
+            return;
+        }
+    }
 
+    // ---- SPEED ----
+    if (window._speedBtnBox) {
+        const b = window._speedBtnBox;
+        if (touchX >= b.x && touchX <= b.x + b.w &&
+            touchY >= b.y && touchY <= b.y + b.h) {
+            cycleSpeed();
+            return;
+        }
+    }
+
+    // If game is paused, block all other input
+    if (gamePaused) return;
+
+*/
     const nameBox = window._playerNameBox;
     if (g===2 && nameBox && touchX >= nameBox.x && touchX <= nameBox.x + nameBox.w &&
         touchY >= nameBox.y && touchY <= nameBox.y + nameBox.h) {
@@ -15050,14 +15731,15 @@ loadAchievements();
             ctx.beginPath();
             ctx.arc(page.x + 14, page.y + 14, 45, 0, Math.PI * 2);
             ctx.fill();
-            setTimeout(logo, 300);
+            
             clearTimeout(window._landingPageTimeout);
             window._landingPageTimeout = setTimeout(function() {
                 ctx.clearRect(0, 0, cW, cH);
+                g=15;
                 launchAIMatch();
                 n = 1;                
                 landingPageClickLock = false;
-            }, 3300);
+            }, 300);
             return;
         }
     }
@@ -16678,9 +17360,8 @@ function executeHumanMove(button, targetCell, currentTeam) {
         playSound(ball);
         n++;     
         moveManimation();
-    }, 500); 
-    
-   // r++;
+    }, 500);     
+   
 
     saveMoveToHistory({
         moveNumber: m,
@@ -16701,7 +17382,7 @@ function executeHumanMove(button, targetCell, currentTeam) {
   
 if (!matchInProgress) {  
     if (n < 28) {
-        var timerCom = setTimeout(compMove, 10000);
+        var timerCom = setTimeout(compMove, 7000);
     }
     }
     
@@ -16717,17 +17398,13 @@ if (!matchInProgress) {
 const moveFunctions = [
     startMove,
     goalMove,
-    blockMove,
-    midBlock,
+    blockMove,    
     fullChance,
-    halfChance,
-    midChance,
+    halfChance,    
     creativeMoveplus,
     creativeMove,
-    safeUp,
     anysafeMoveplus,
-    anysafeMove,
-    safeDown,
+    anysafeMove,    
     anyWhichMove,
     anyWhereMove,
     anyHowMove
@@ -16769,23 +17446,19 @@ function compMove() {
     // Priority chain — stops at first success
     if (goalMove()) { saveOpponentLogsToHistory(); return; }
     if (blockMove()) { saveOpponentLogsToHistory(); return; }
-    if (midBlock()) { saveOpponentLogsToHistory(); return; }
-    if (fullChance()) { saveOpponentLogsToHistory(); return; }
+       if (fullChance()) { saveOpponentLogsToHistory(); return; }
     if (halfChance()) { saveOpponentLogsToHistory(); return; }
-    if (midChance()) { saveOpponentLogsToHistory(); return; }
-    
+        
     // Genius level
     if (l < 1) {
         if (creativeMoveplus()) { saveOpponentLogsToHistory(); return; }
         if (creativeMove()) { saveOpponentLogsToHistory(); return; }
-         if (safeUp()) { saveOpponentLogsToHistory(); return; }
-    }
+            }
    
     // Advanced level
     if (l < 2) {        
         if (anysafeMoveplus()) { saveOpponentLogsToHistory(); return; }
-        if (safeDown()) { saveOpponentLogsToHistory(); return; }
-    }
+            }
     
     // Intermediate level
     if (l < 3) {
@@ -16810,74 +17483,46 @@ function compMove() {
 // ============================================================
 
 function initcanvas() {
-    
-    // ===========================================
-    // ✅ STEP 2: NORMAL LOADING
-    // ===========================================
-            canvas = document.getElementById('gameCanvas');
-        ctx = canvas.getContext('2d');
-        
-        canvas.width = DESIGN_WIDTH;
-        canvas.height = DESIGN_HEIGHT;
-        cW = DESIGN_WIDTH;
-        cH = DESIGN_HEIGHT;
-        
-        // Mark as cached for offline use
-        localStorage.setItem('mathsoccer_cached', 'true');
-                  
-       
-    // ✅ Set container to actual window size
-    const container = document.getElementById('gameContainer');
-    container.style.width = window.innerWidth + 'px';
-    container.style.height = window.innerHeight + 'px';
-    
-    resizeCanvas();
-    
-    window.addEventListener('resize', function() {
-        const currentHeight = window.innerHeight;
-        const isKeyboardOpen = currentHeight < previousHeight;
-        
-        if (isKeyboardOpen) {
-            previousHeight = currentHeight;
-            return;
-        }
-        
-        previousHeight = currentHeight;
-        // ✅ Update container size on resize
-        container.style.width = window.innerWidth + 'px';
-        container.style.height = window.innerHeight + 'px';
-        resizeCanvas();
-    });
-    
+    canvas = document.getElementById('gameCanvas');
+    ctx = canvas.getContext('2d');
+    cW = DESIGN_WIDTH;
+    cH = DESIGN_HEIGHT;
 
-window.addEventListener('resize', function() {
-    clearTimeout(resizeTimeout);
-    resizeTimeout = setTimeout(() => {
-        resizeCanvas();
-    }, 300);  // Wait 300ms after resize stops
-});
-    window.addEventListener('orientationchange', function() {
-        setTimeout(resizeCanvas, 300);
-    });
-    
-    // Setup touch and mouse
+    // Mark as cached for offline use
+    localStorage.setItem('mathsoccer_cached', 'true');
+
+    // Set container to actual window size
+    const container = document.getElementById('gameContainer');
+    if (container) {
+        container.style.width  = window.innerWidth  + 'px';
+        container.style.height = window.innerHeight + 'px';
+    }
+
+    // resizeCanvas() now handles DPR + visualViewport
+    resizeCanvas();
+
+    // Single consolidated resize handler (defined outside initcanvas)
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('orientationchange', () => setTimeout(resizeCanvas, 300));
+
+    // Setup touch, mouse, keyboard
     setupInputHandlers();
-    
+    setupDesktopControls();
+    setupKeyboardControls();
+
+    // Fallback audio resume (harmless; real unlock is on first touch)
     setTimeout(resumeAudio, 1000);
 
-// Use this in your touch handlers:
-// if (Math.abs(touchX - targetX) < getDeviceTouchTolerance()) { ... }
- // Setup controls
-            setupDesktopControls();
-            setupKeyboardControls();
-            loadPlayerData(); 
-g = 0;
-loadTags();
-loadTagsVisibility();
-checkExistingUser();
-logo();
-var splashMath= setTimeout(showLandingPage,3000);
+    g = 0;
+    checkExistingUser();
+    logo();
+    setTimeout(showLandingPage, 3000);
+    captureBaseTransform();
 }
+
+window.addEventListener('load', function() {
+    initcanvas();
+});
 
 // Re-acquire when page becomes visible again
 document.addEventListener('visibilitychange', () => {
@@ -16886,13 +17531,7 @@ document.addEventListener('visibilitychange', () => {
     }
 });
 
-   //loading the canvas
-  
-window.addEventListener('load', function(event){
-initcanvas();
-});
-
-</script>
+   </script>
   
 </head>
   
@@ -17031,6 +17670,56 @@ if ('serviceWorker' in navigator) {
     });
 }
 
+// ============================================================
+// RESIZE + ORIENTATION + INITIAL LOAD (iOS 100vh safe)
+// ============================================================
+
+
+function handleResize() {
+    const currentHeight = window.innerHeight;
+    const isKeyboardOpen = currentHeight < previousHeight;
+
+    if (isKeyboardOpen) {
+        previousHeight = currentHeight;
+        return;
+    }
+    previousHeight = currentHeight;
+
+    const container = document.getElementById('gameContainer');
+    if (container) {
+        container.style.width  = window.innerWidth  + 'px';
+        container.style.height = window.innerHeight + 'px';
+    }
+
+    clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(() => {
+        resizeCanvas();
+        redrawGameScreen();
+        const vh = window.innerHeight * 0.01;
+        document.documentElement.style.setProperty('--vh', `${vh}px`);
+    }, 300);
+}
+
+// iOS 100vh fix — runs on load AND on every resize
+function applyVHFix() {
+    const vh = window.innerHeight * 0.01;
+    document.documentElement.style.setProperty('--vh', `${vh}px`);
+}
+
+window.addEventListener('load', () => {
+    setTimeout(() => {
+        resizeCanvas();
+        redrawGameScreen();
+        applyVHFix();      // ← runs on first load
+    }, 100);
+});
+
+window.addEventListener('resize', handleResize);
+window.addEventListener('orientationchange', () => setTimeout(() => {
+    resizeCanvas();
+    applyVHFix();
+}, 300));
+
 function updateInstallUI() {
     const btn = document.getElementById('installButton');
     if (!btn) return;
@@ -17084,22 +17773,6 @@ document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && typeof matchInProgress !== 'undefined' && matchInProgress && typeof requestWakeLock === 'function') {
         requestWakeLock();
     }
-});
-
-// iPhone black screen fix - force canvas resize after load
-window.addEventListener('load', () => {
-    setTimeout(() => {
-        if (typeof resizeCanvas === 'function') resizeCanvas();
-        if (typeof redrawGameScreen === 'function') redrawGameScreen();
-        // iOS 100vh fix
-        const vh = window.innerHeight * 0.01;
-        document.documentElement.style.setProperty('--vh', `${vh}px`);
-    }, 100);
-});
-
-window.addEventListener('resize', () => {
-    const vh = window.innerHeight * 0.01;
-    document.documentElement.style.setProperty('--vh', `${vh}px`);
 });
 
 </script>

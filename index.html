@@ -4190,6 +4190,53 @@ function renderHistoryPage() {
     const endIdx = Math.min(startIdx + historyPerPage, gameHistory.length);
     const pageMoves = gameHistory.slice(startIdx, endIdx);
     
+    // Title
+ctx.fillStyle = '#CFC';
+ctx.font = 'bold 24px fantasy, papyrus';
+ctx.textAlign = 'center';
+ctx.textBaseline = 'middle';
+ctx.fillText('MATHSOCCER HISTORY', 170, 30);
+
+// === RED vs BLUE subtitle in the gap ===
+if (matchInProgress) {
+    const difficultyNames = ['GENIUS', 'ADVANCED', 'INTERMEDIATE', 'BEGINNER'];
+    const redDifficulty  = (side === 0) ? aiDifficulty     : playerDifficulty;
+    const blueDifficulty = (side === 0) ? playerDifficulty : aiDifficulty;
+    const redName  = difficultyNames[redDifficulty];
+    const blueName = difficultyNames[blueDifficulty];
+
+    ctx.font = 'bold 12px fantasy, papyrus';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    const centerY = 51;                 // sits in the 13px gap
+    const label   = `⚔️ ${redName} vs ${blueName} AI Match`;
+
+    // measure so red stays red and blue stays blue
+    const redPart  = `⚔️ ${redName} `;
+    const vsPart   = 'vs ';
+    const bluePart = `${blueName}`;
+
+    const wRed  = ctx.measureText(redPart).width;
+    const wVs   = ctx.measureText(vsPart).width;
+    const wBlue = ctx.measureText(bluePart).width;
+    let cursorX = 170 - (wRed + wVs + wBlue) / 2;
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#FF4444';
+    ctx.fillText(redPart, cursorX, centerY);
+    cursorX += wRed;
+
+    ctx.fillStyle = '#CFC';
+    ctx.fillText(vsPart, cursorX, centerY);
+    cursorX += wVs;
+
+    ctx.fillStyle = '#4488FF';
+    ctx.fillText(bluePart, cursorX, centerY);
+
+    ctx.textAlign = 'center';
+}
+    
     if (gameHistory.length === 0) {
         ctx.fillStyle = 'white';
         ctx.font = 'bold 16px fantasy, papyrus';

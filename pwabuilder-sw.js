@@ -1,9 +1,9 @@
 // MathSoccer Service Worker
 // Mathsoccer repo - offline PWA version
 
-const CACHE_NAME = 'mathsoccer-v10-audio';
+const CACHE_NAME = 'mathsoccer-v15-audio';
 
-const APP_ROOT = '/Mathsoccer/';
+const APP_ROOT = '/Mathsoccer-ava/';
 
 // ✅ FILES TO CACHE - NO APP_ROOT ALONE!
 const FILES_TO_CACHE = [
@@ -28,6 +28,7 @@ const AUDIO_FILES = [
     APP_ROOT + 'crowd_louds.mp3',
     APP_ROOT + 'Mathsoccer_cool.mp3',
     APP_ROOT + 'maths.mp3',
+    APP_ROOT + 'guess.mp3',
     APP_ROOT + 'disappointed.mp3'
 ];
 

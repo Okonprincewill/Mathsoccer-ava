@@ -1,10 +1,10 @@
 {
-  "id": "/Mathsoccer/",
-  "name": "Mathsoccer - AI does the math. You score the goals.",
+  "id": "/Mathsoccer-ava/",
+  "name": "Mathsoccer - AI does the math. You watch the balance.",
   "short_name": "Mathsoccer",
-  "description": "The world's only factor handoff system combining chess, maths and football. Score goals on a chess board using multiplication, division, factors and inequality. AI does the math. You score the goals.",
-  "start_url": "/Mathsoccer/",
-  "scope": "/Mathsoccer/",
+  "description": "The world's first balance simulation and factor handoff system based on the law of imbalance. AI does the math. You watch the balance.",
+  "start_url": "/Mathsoccer-ava/",
+  "scope": "/Mathsoccer-ava/",
   "display": "standalone",
   "display_override": [
     "standalone",

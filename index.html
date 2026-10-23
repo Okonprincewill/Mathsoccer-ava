@@ -6296,19 +6296,12 @@ ctx.textBaseline = 'middle';
         drawAnswerTag(ansquare);
     });
 
-    if (g > 1) { drawToggles(); }
-if(n > 1 || m > 1){
-    if (n < 28) { drawMover(); }
-    drawScorer();
-    // ✅ Suppress the previous-move threat highlights while a button
-    //    is selected (i.e. during the highlight phase of a live move).
-    //    Otherwise frameDirectLinks / frameGoalMouths paint over the
-    //    selection's own link frames, producing a "misfired" highlight.
-    if (!selectedButton) {
+    if(n > 1 || m > 1){
+        if (n < 28) { drawMover(); }
+        drawScorer();
         frameDirectLinks();
         frameGoalMouths();
     }
-}
 
 if (guessHighlightCell) {
     ctx.save();

@@ -70,21 +70,10 @@
     outline: none;
     margin: 0;
     padding: 0;
-
     touch-action: none;
-    -ms-touch-action: none;
-
-    -webkit-user-select: none;
-    user-select: none;
-    -webkit-touch-callout: none;
-
     image-rendering: pixelated;
     max-width: 100vw;
     max-height: 100vh;
-
-    position: fixed;
-    top: 0;
-    left: 0;
 }
         
         /* Desktop Controls */
@@ -1555,37 +1544,44 @@ async function releaseWakeLock() {
 //  RESIZE CANVAS — No overflow, minimal black bars
 // ============================================================
 function resizeCanvas() {
+    // Get the ACTUAL visible area (excluding browser UI)
     let screenW, screenH;
+    
+    const dpr = window.devicePixelRatio || 1;
+canvas.width = canvas.clientWidth * dpr;
+canvas.height = canvas.clientHeight * dpr;
+ctx.scale(dpr, dpr);
+    
     if (window.visualViewport) {
+        // Mobile: Use visualViewport (excludes browser chrome)
         screenW = window.visualViewport.width;
         screenH = window.visualViewport.height;
     } else {
+        // Desktop fallback
         screenW = window.innerWidth;
         screenH = window.innerHeight;
     }
-
-    const dpr = Math.min(window.devicePixelRatio || 1, 3); // cap at 3 for perf
-
-    canvas.width  = Math.floor(360 * dpr);
-    canvas.height = Math.floor(800 * dpr);
-
-    canvas.style.width  = screenW + 'px';
+    
+    const scaleX = screenW / 360;
+    const scaleY = screenH / 800;
+    const scale = Math.max(scaleX, scaleY);  // Fill screen (no black bars)
+    
+    canvas.width = 360;
+    canvas.height = 800;
+    cW = 360;
+    cH = 800;
+    
+    // Set canvas to match visual viewport exactly
+    canvas.style.width = screenW + 'px';
     canvas.style.height = screenH + 'px';
     canvas.style.position = 'fixed';
     canvas.style.left = '0';
     canvas.style.top = '0';
     canvas.style.transform = 'none';
-    canvas.style.maxWidth = 'none';   // ← prevents CSS max-width from shrinking it
-    canvas.style.maxHeight = 'none';
-
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);  // scale once, not per draw
-
-    window._dpr = dpr;   // ← needed by showCalculationAnimation + moveManimation
-
-    cW = 360;
-    cH = 800;
-
+    
+    window._scale = scale;
     redrawGameScreen();
+    captureBaseTransform();
 }
 
 
@@ -7818,7 +7814,7 @@ const colorWord = lastMoveData.moveTeam === 'red' ? 'Red' : 'Blue';
         vb = `from ${from} to ${to}. ${chance}. ${pts}pt${pts === 1 ? '' : 's'}.`;
     } else {
     const colorWord = lastMoveData.moveTeam === 'red' ? 'Red' : 'Blue';
-        vb = '${colorWord} ${diffName} starts.';
+        vb = `${colorWord} ${diffName} starts.`;
     }
 
     // ----------------------------------------------------------
@@ -9575,7 +9571,7 @@ if (l < 1) {
             // ===========================================
             let newRuleApplies = false;
 
-            if (factorCanReach(blockerCell.id, vulFac) && hasOpponentLink(blockerCell)) {
+            if (factorCanReach(blockerCell.id, vulFac) && isLinkedToCompAns(blockingButton) && hasOpponentLink(blockerCell)) {
     const betweenCell = answer.find(cell =>
         cell.x === positions[3].x &&
         cell.occupancy === 'no' &&
@@ -9661,7 +9657,11 @@ if (l < 1) {
                 factorCanReach(cell.id, vulFac)
             );
             // Is compAns between the blocker and the mid button?
-            const isCompAnsBetween = (isDown) ?
+            const isCompAnsBetween =
+compAns.x === positions[3].x &&
+                compAns.x + 3 === blockingButton.x && compAns.x+ 3 === anyBut.x &&
+                
+(isDown) ?
                 (compAns.y + 3 > blockingButton.y && compAns.y + 3 < anyBut.y) :
                 (compAns.y + 3 < blockingButton.y && compAns.y + 3 > anyBut.y);
 
@@ -9686,15 +9686,19 @@ if (l < 1) {
                     if (hasOpponentLinkToMid) {
 
                         // PREVENTIVE SKIP: compAns physically blocks the path
-                        const compAnsBlocksPath = (isDown)
+                        const compAnsBlocksPath = compAns.x === positions[3].x &&
+                compAns.x + 3 === blockingButton.x && compAns.x + 3 === anyBut.x &&
+(isDown)
                             ? (compAns.y + 3 > positions[3].y && compAns.y + 3 < anyNum.y)
                             : (compAns.y + 3 < positions[3].y && compAns.y + 3 > anyNum.y);
 
-                        if (!compAnsBlocksPath) {
+                        if (compAns.x === positions[3].x &&
+                compAns.x + 3 === blockingButton.x && compAns.x + 3 === anyBut.x && !compAnsBlocksPath) {
 
                             // B4: find blocking cell between own goal and midNum
                             const blockingCell = answer.find(block =>
-                                block.x === positions[3].x && compAns.id !== block.id &&
+                                block.x === positions[3].x &&
+                block.x + 3 === blockingButton.x && block.x + 3 === anyBut.x && compAns.id !== block.id &&
                                 ((dir === "down") ?
                                     (block.y > positions[3].y && block.y + 3 < anyNum.y) :
                                     (block.y < positions[3].y && block.y + 3 > anyNum.y)) && block !== positions[3]
@@ -10576,7 +10580,7 @@ for (let whiteSquare of whiteSquares) {
         continue;
     }
     
-    if (!canBlockAttack(ansList, opponentButton, whiteSquare) && l < 2) {
+    if (!blocksAttack && l < 2) {
         exemptAnswers.add(ansList);
         logExemptedNumber(ansList.id, "to protect "+whiteSquare.id);
     }
@@ -11066,7 +11070,7 @@ else {
             }
             
             if (!defFac || defFac < 1 || defFac > 9) {
-                continue;
+                return;
             }
             
             // RULES #4 & #5: CASCADE EXEMPTIONS
@@ -11302,7 +11306,7 @@ if (positions[4] && positions[5] &&
                     const defFacCanReachWhite1 = (positions[1].id >= defFac && positions[1].id % defFac === 0 && positions[1].id / defFac <= 9) ||
                                                   (positions[1].id < defFac && defFac % positions[1].id === 0);
 
-                    if (!defFac || defFac < 1 || defFac > 81) {
+                    if (!defFac || defFac < 1 || defFac > 9) {
                         continue;
                     }
                     

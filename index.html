@@ -3383,7 +3383,7 @@ ctx.restore();
 
             // ✅ DRAW ASSIST (if it exists)
 if (goal.assist) {
-    ctx.fillStyle = goal.col; // Team colour
+    ctx.fillStyle = '#CFC'; // Team colour
     ctx.font = 'bold 9px fantasy, papyrus';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
@@ -3455,7 +3455,7 @@ redScorerY += scorerSpacing;
 
             // ✅ DRAW ASSIST (if it exists)
 if (goal.assist) {
-    ctx.fillStyle = goal.col; // Team colour
+    ctx.fillStyle = '#CFC'; // Team colour
     ctx.font = 'bold 9px fantasy, papyrus';
     ctx.textAlign = 'right';
     ctx.textBaseline = 'middle';
@@ -4607,7 +4607,7 @@ function renderOpponentLogsPage() {
     ctx.font = 'bold 16px fantasy, papyrus';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    ctx.fillText('VALID NUMBERS:', 10, yPos);
+    ctx.fillText('SAFE NUMBERS:', 10, yPos);
     yPos += 18;
     
     ctx.fillStyle = '#CFC';
@@ -7391,7 +7391,7 @@ function drawBut(x, y, but,N) {
     // Assist provider — above the move number, smaller, team colour
 
 if(c===1){
-    ctx.fillStyle = but.col;
+    ctx.fillStyle = '#CFC';
     ctx.font = 'bold 11px fantasy, papyrus';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';

@@ -7300,6 +7300,7 @@ if(targetAnswer.id<problemFactor&&problemFactor%targetAnswer.id==0){
   stats[1].value=String(problemFactor/targetAnswer.id);
 calc.value=String(problemFactor+" \u00F7 "+problemFactor/targetAnswer.id+" = "+targetAnswer.id);
 }
+speakText(calc.value); 
 }
 
    let scorer = [];
@@ -8688,6 +8689,7 @@ statDraw(va,vb,vc,vd,ve,vf,vg,vh );
 }, Math.max(500, 10000 / gameSpeedMultiplier));
 }
 
+//speakText(`factor is equal to ${problemFactor}`);
 r++;
        
     generateNextTurnDisplay();

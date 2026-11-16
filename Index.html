@@ -12929,15 +12929,29 @@ function calculatePoints(isComputer) {
 // GENERATE MOVE 1 DISPLAY DATA (for game start)
 // ===========================================
 function generateMove1DisplayData() {
-    // Set global display variables - NO statDraw here!
-        vb = "is a balance simulation system ";
-    vc = "used to prevent access to circled home ";
-    vd = "territories and number 1 seat, while ";
-    ve = "aiming for the next number 1 seat, ";
+    const isRedTurn = (r % 2 !== 0);
+    const currentTeam = isRedTurn ? 'blue' : 'red';
+    const turnNumber = m;
+    
+// Set global display variables - NO statDraw here!
+    vb = "is a balance simulation ";
+    vc = "system used to prevent access to ";
+    vd = "circled home territories, while ";
+    ve = "aiming for the top number 1, ";
     va = "MATHSOCCER";
     vf = "based on Princewill's ";
     vg = "law of imbalance.";
-    vh = 'white';
+    vh = currentTeam;
+    if (!matchInProgress) {  
+    speakText("Always read the Mathsoccer textbox for your best move options.");
+    }
+    
+  const difficultyNames = ['genius', 'advanced', 'intermediate', 'beginner'];
+const currentDifficulty = difficultyNames[l] || 'genius';
+
+if (!matchInProgress) {  
+speakText(`Wait for your ${currentDifficulty} opponent to pass first`);
+}
 }
      
 // ===========================================
@@ -13840,9 +13854,9 @@ ctx.fillText("which number the token will move to.", 180, 535);
     ctx.fillText("Click AI match to watch unlimited matches. ", 180, 700);
 ctx.fillText("Every token starts in a balanced diamond of four - the  ", 180, 715);
 ctx.fillText("comfort zone. A factor breaks the diamond formation ", 180, 730);
-ctx.fillText("and a race to occupy the number 1 seat and rebuild the ", 180, 745);
-ctx.fillText("diamond begins. Watch the diamond break. Follow the ", 180, 760);
-ctx.fillText("factors. Click guess the next move. Toggle the game over ", 180, 775);
+ctx.fillText("and a race to occupy number 1 and rebuild the diamond", 180, 745);
+ctx.fillText("begins. Watch the diamond break. Follow the factors. ", 180, 760);
+ctx.fillText("Click guess the next move. Toggle the game over ", 180, 775);
 ctx.fillText("table for AI goals, AI points, or your guess scores.", 180, 790);
 
     // ===========================================
